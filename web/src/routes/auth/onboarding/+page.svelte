@@ -11,9 +11,8 @@
   import OnboardingTheme from './OnboardingTheme.svelte';
   import OnboardingUserPrivacy from './OnboardingUserPrivacy.svelte';
   import { authManager } from '$lib/managers/auth-manager.svelte';
-  import { serverConfigManager } from '$lib/managers/server-config-manager.svelte';
   import { queryClient } from '$lib/queries/client';
-  import { getConfigQuery } from '$lib/queries/system-config.query';
+  import { getAdminConfigQuery } from '$lib/queries/config-admin.query';
   import { Route } from '$lib/route';
   import { OnboardingRole } from '$lib/types';
   import { setUserOnboarding, updateAdminOnboarding } from '@immich/sdk';
@@ -27,6 +26,11 @@
   } from '@mdi/js';
   import { onMount } from 'svelte';
   import { t } from 'svelte-i18n';
+  import { createPreloadedQuery } from '$lib/queries/client';
+  import { getServerConfigQuery } from '$lib/queries/server.query';
+
+  const query = createPreloadedQuery(getServerConfigQuery);
+  const serverConfig = $derived(query.data);
 
   interface OnboardingStep {
     name: string;
@@ -102,7 +106,7 @@
     return temporaryIndex === -1 ? 0 : temporaryIndex;
   });
   let userRole = $derived(
-    authManager.user.isAdmin && !serverConfigManager.value.isOnboarded ? OnboardingRole.SERVER : OnboardingRole.USER,
+    authManager.user.isAdmin && !serverConfig.isOnboarded ? OnboardingRole.SERVER : OnboardingRole.USER,
   );
 
   let onboardingStepCount = $derived(onboardingSteps.filter((step) => shouldRunStep(step.role, userRole)).length);
@@ -113,9 +117,7 @@
   const shouldRunStep = (stepRole: OnboardingRole, userRole: OnboardingRole) => {
     return (
       stepRole === OnboardingRole.USER ||
-      (stepRole === OnboardingRole.SERVER &&
-        userRole === OnboardingRole.SERVER &&
-        !serverConfigManager.value.isOnboarded)
+      (stepRole === OnboardingRole.SERVER && userRole === OnboardingRole.SERVER && !serverConfig.isOnboarded)
     );
   };
 
@@ -131,7 +133,7 @@
     if (nextStepIndex === -1) {
       if (authManager.user.isAdmin) {
         await updateAdminOnboarding({ adminOnboardingUpdateDto: { isOnboarded: true } });
-        await serverConfigManager.loadServerConfig();
+        await queryClient.invalidateQueries({ queryKey: getServerConfigQuery().queryKey });
       }
 
       await setUserOnboarding({
@@ -156,7 +158,7 @@
 
   onMount(async () => {
     if (userRole === OnboardingRole.SERVER) {
-      await queryClient.query(getConfigQuery());
+      await queryClient.query(getAdminConfigQuery());
     }
   });
 </script>
