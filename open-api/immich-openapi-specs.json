@@ -7514,6 +7514,56 @@
         "x-immich-state": "Stable"
       }
     },
+    "/libraries/recompute-checksums": {
+      "post": {
+        "description": "Queue a background job that recomputes asset checksums. External libraries use the configured checksum algorithm, uploads always use the content SHA-1.",
+        "operationId": "recomputeChecksums",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecomputeChecksumsDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          },
+          {
+            "cookie": []
+          },
+          {
+            "api_key": []
+          }
+        ],
+        "summary": "Recompute asset checksums",
+        "tags": [
+          "Libraries"
+        ],
+        "x-immich-admin-only": true,
+        "x-immich-history": [
+          {
+            "version": "v3.3.0",
+            "state": "Added"
+          },
+          {
+            "version": "v3.3.0",
+            "state": "Beta"
+          }
+        ],
+        "x-immich-permission": "library.update",
+        "x-immich-state": "Beta"
+      }
+    },
     "/libraries/{id}": {
       "delete": {
         "description": "Delete an external library by its ID.",
@@ -19523,8 +19573,28 @@
         ],
         "type": "object"
       },
+      "AdminConfigLibraryChecksumDto": {
+        "properties": {
+          "dedupeUploadsAgainstLibraries": {
+            "description": "Treat an upload as a duplicate when an external library asset has the same content checksum",
+            "type": "boolean"
+          },
+          "external": {
+            "$ref": "#/components/schemas/ChecksumAlgorithm",
+            "description": "Checksum algorithm used when importing assets from external libraries"
+          }
+        },
+        "required": [
+          "dedupeUploadsAgainstLibraries",
+          "external"
+        ],
+        "type": "object"
+      },
       "AdminConfigLibraryDto": {
         "properties": {
+          "checksum": {
+            "$ref": "#/components/schemas/AdminConfigLibraryChecksumDto"
+          },
           "scan": {
             "$ref": "#/components/schemas/AdminConfigLibraryScanDto"
           },
@@ -19533,6 +19603,7 @@
           }
         },
         "required": [
+          "checksum",
           "scan",
           "watch"
         ],
@@ -22136,6 +22207,22 @@
         ],
         "type": "object"
       },
+      "ChecksumAlgorithm": {
+        "description": "Checksum algorithm",
+        "enum": [
+          "sha1",
+          "sha1-path"
+        ],
+        "type": "string"
+      },
+      "ChecksumRehashTarget": {
+        "description": "Which assets to recompute checksums for",
+        "enum": [
+          "external",
+          "upload"
+        ],
+        "type": "string"
+      },
       "ClusterGroupRequestCreateDto": {
         "properties": {
           "userId": {
@@ -23220,6 +23307,7 @@
           "LibrarySyncFilesQueueAll",
           "LibrarySyncFiles",
           "LibraryScanQueueAll",
+          "LibraryRehash",
           "HlsSessionCleanup",
           "MemoryCleanup",
           "MemoryGenerate",
@@ -27687,6 +27775,23 @@
             "type": "boolean"
           }
         },
+        "type": "object"
+      },
+      "RecomputeChecksumsDto": {
+        "properties": {
+          "libraryId": {
+            "description": "Only recompute checksums for this external library",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$",
+            "type": "string"
+          },
+          "target": {
+            "$ref": "#/components/schemas/ChecksumRehashTarget"
+          }
+        },
+        "required": [
+          "target"
+        ],
         "type": "object"
       },
       "ReleaseChannel": {

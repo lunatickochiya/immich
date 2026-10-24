@@ -180,6 +180,12 @@ export type AdminConfigJobDto = {
     videoConversion: AdminConfigJobSettingsDto;
     workflow: AdminConfigJobSettingsDto;
 };
+export type AdminConfigLibraryChecksumDto = {
+    /** Treat an upload as a duplicate when an external library asset has the same content checksum */
+    dedupeUploadsAgainstLibraries: boolean;
+    /** Checksum algorithm used when importing assets from external libraries */
+    external: ChecksumAlgorithm;
+};
 export type AdminConfigLibraryScanDto = {
     /** Cron expression */
     cronExpression: string;
@@ -191,6 +197,7 @@ export type AdminConfigLibraryWatchDto = {
     enabled: boolean;
 };
 export type AdminConfigLibraryDto = {
+    checksum: AdminConfigLibraryChecksumDto;
     scan: AdminConfigLibraryScanDto;
     watch: AdminConfigLibraryWatchDto;
 };
@@ -1846,6 +1853,11 @@ export type CreateLibraryDto = {
     name?: string;
     /** Owner user ID */
     ownerId: string;
+};
+export type RecomputeChecksumsDto = {
+    /** Only recompute checksums for this external library */
+    libraryId?: string;
+    target: ChecksumRehashTarget;
 };
 export type UpdateLibraryDto = {
     /** Exclusion patterns (max 128) */
@@ -5683,6 +5695,18 @@ export function createLibrary({ createLibraryDto }: {
     })));
 }
 /**
+ * Recompute asset checksums
+ */
+export function recomputeChecksums({ recomputeChecksumsDto }: {
+    recomputeChecksumsDto: RecomputeChecksumsDto;
+}, opts?: Oazapfts.RequestOpts) {
+    return oazapfts.ok(oazapfts.fetchText("/libraries/recompute-checksums", oazapfts.json({
+        ...opts,
+        method: "POST",
+        body: recomputeChecksumsDto
+    })));
+}
+/**
  * Delete a library
  */
 export function deleteLibrary({ id }: {
@@ -8216,6 +8240,10 @@ export enum ImageFormat {
     Jpeg = "jpeg",
     Webp = "webp"
 }
+export enum ChecksumAlgorithm {
+    Sha1 = "sha1",
+    Sha1Path = "sha1-path"
+}
 export enum LogLevel {
     Verbose = "verbose",
     Debug = "debug",
@@ -8575,6 +8603,10 @@ export enum QueueCommand {
     Empty = "empty",
     ClearFailed = "clear-failed"
 }
+export enum ChecksumRehashTarget {
+    External = "external",
+    Upload = "upload"
+}
 export enum MemorySearchOrder {
     Asc = "asc",
     Desc = "desc",
@@ -8641,6 +8673,7 @@ export enum JobName {
     LibrarySyncFilesQueueAll = "LibrarySyncFilesQueueAll",
     LibrarySyncFiles = "LibrarySyncFiles",
     LibraryScanQueueAll = "LibraryScanQueueAll",
+    LibraryRehash = "LibraryRehash",
     HlsSessionCleanup = "HlsSessionCleanup",
     MemoryCleanup = "MemoryCleanup",
     MemoryGenerate = "MemoryGenerate",

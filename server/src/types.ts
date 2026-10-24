@@ -12,6 +12,7 @@ import {
   AssetOrder,
   AssetType,
   Av1Profile,
+  ChecksumRehashTarget,
   ColorMatrix,
   ColorPrimaries,
   ColorTransfer,
@@ -258,6 +259,11 @@ export interface ILibraryBulkIdsJob {
   totalAssets: number;
 }
 
+export interface ILibraryRehashJob {
+  target: ChecksumRehashTarget;
+  libraryId?: string;
+}
+
 export interface IDeleteFilesJob extends IBaseJob {
   files: Array<string | null | undefined>;
 }
@@ -431,6 +437,7 @@ export type JobItem =
   | { name: JobName.LibraryDelete; data: IEntityJob }
   | { name: JobName.LibraryScanQueueAll; data?: IBaseJob }
   | { name: JobName.LibraryDeleteCheck; data: IBaseJob }
+  | { name: JobName.LibraryRehash; data: ILibraryRehashJob }
 
   // Notification
   | { name: JobName.SendMail; data: IEmailJob }

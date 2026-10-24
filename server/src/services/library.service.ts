@@ -13,6 +13,7 @@ import {
   CreateLibraryDto,
   LibraryResponseDto,
   LibraryStatsResponseDto,
+  RecomputeChecksumsDto,
   UpdateLibraryDto,
   ValidateLibraryDto,
   ValidateLibraryImportPathResponseDto,
@@ -23,6 +24,7 @@ import {
   AssetStatus,
   AssetType,
   ChecksumAlgorithm,
+  ChecksumRehashTarget,
   CronJob,
   DatabaseLock,
   ImmichWorker,
@@ -33,6 +35,7 @@ import {
 import { AssetSyncResult } from 'src/repositories/library.repository.js';
 import { AssetTable } from 'src/schema/tables/asset.table.js';
 import { BaseService } from 'src/services/base.service.js';
+import { isAssetChecksumConstraint } from 'src/utils/database.js';
 import { mimeTypes } from 'src/utils/mime-types.js';
 import { batched, findOrFail, handlePromiseError } from 'src/utils/misc.js';
 
@@ -263,11 +266,14 @@ export class LibraryService extends BaseService {
       return JobStatus.Failed;
     }
 
+    const {
+      library: { checksum },
+    } = await this.getConfig({ withCache: true });
     const assetImports: Insertable<AssetTable>[] = [];
     await Promise.all(
       job.paths.map(async (path) => {
         try {
-          const asset = await this.processEntity(path, library.ownerId, job.libraryId);
+          const asset = await this.processEntity(path, library.ownerId, job.libraryId, checksum.external);
           assetImports.push(asset);
         } catch (error) {
           this.logger.error(`Error processing ${path} for library ${job.libraryId}: ${error}`);
@@ -275,7 +281,18 @@ export class LibraryService extends BaseService {
       }),
     );
 
-    const assetIds = await this.assetRepository.createAll(assetImports);
+    const filtered = await this.filterDuplicateChecksums(job.libraryId, library.ownerId, assetImports);
+    let assetIds: string[];
+    try {
+      assetIds = await this.assetRepository.createAll(filtered);
+    } catch (error) {
+      if (!isAssetChecksumConstraint(error)) {
+        throw error;
+      }
+
+      // Another import inserted the same content concurrently. Retry one by one and skip duplicates.
+      assetIds = await this.createAssetsSkippingDuplicates(filtered);
+    }
 
     const progressMessage =
       job.progressCounter && job.totalAssets
@@ -399,15 +416,23 @@ export class LibraryService extends BaseService {
     return JobStatus.Success;
   }
 
-  private async processEntity(filePath: string, ownerId: string, libraryId: string) {
+  private async processEntity(
+    filePath: string,
+    ownerId: string,
+    libraryId: string,
+    checksumAlgorithm: ChecksumAlgorithm,
+  ) {
     const assetPath = path.normalize(filePath);
     const stat = await this.storageRepository.stat(assetPath);
 
     return {
       ownerId,
       libraryId,
-      checksum: this.cryptoRepository.hashSha1(`path:${assetPath}`),
-      checksumAlgorithm: ChecksumAlgorithm.sha1Path,
+      checksum:
+        checksumAlgorithm === ChecksumAlgorithm.sha1File
+          ? await this.cryptoRepository.hashFile(assetPath)
+          : this.cryptoRepository.hashSha1(`path:${assetPath}`),
+      checksumAlgorithm,
       originalPath: assetPath,
 
       fileCreatedAt: stat.mtime,
@@ -418,6 +443,154 @@ export class LibraryService extends BaseService {
       isExternal: true,
       livePhotoVideoId: null,
     };
+  }
+
+  private async filterDuplicateChecksums(libraryId: string, ownerId: string, assets: Insertable<AssetTable>[]) {
+    if (assets.length === 0) {
+      return assets;
+    }
+
+    // Path based checksums are unique per path, so there is nothing to de-duplicate
+    if (assets[0].checksumAlgorithm === ChecksumAlgorithm.sha1Path) {
+      return assets;
+    }
+
+    const byChecksum = new Map<string, Insertable<AssetTable>>();
+    for (const asset of assets) {
+      byChecksum.set(asset.checksum.toString('hex'), asset);
+    }
+
+    const checksums = byChecksum
+      .values()
+      .map((asset) => asset.checksum)
+      .toArray();
+    const existing = await this.assetRepository.getLibraryChecksums(ownerId, libraryId, checksums);
+    for (const checksum of existing) {
+      byChecksum.delete(checksum.toString('hex'));
+    }
+
+    const duplicateCount = assets.length - byChecksum.size;
+    if (duplicateCount > 0) {
+      this.logger.log(
+        `Skipped ${duplicateCount} file(s) with duplicate checksums while importing library ${libraryId}`,
+      );
+    }
+
+    return byChecksum.values().toArray();
+  }
+
+  private async createAssetsSkippingDuplicates(assets: Insertable<AssetTable>[]) {
+    const ids: string[] = [];
+    for (const asset of assets) {
+      try {
+        ids.push(...(await this.assetRepository.createAll([asset])));
+      } catch (error) {
+        if (!isAssetChecksumConstraint(error)) {
+          throw error;
+        }
+
+        this.logger.warn(`Skipped duplicate asset ${asset.originalPath} while importing library ${asset.libraryId}`);
+      }
+    }
+
+    return ids;
+  }
+
+  async queueRecomputeChecksums(dto: RecomputeChecksumsDto): Promise<void> {
+    const {
+      library: { checksum },
+    } = await this.getConfig({ withCache: true });
+
+    if (dto.target === ChecksumRehashTarget.Upload) {
+      this.logger.log('Queueing checksum recomputation for uploaded assets');
+      await this.jobRepository.queue({
+        name: JobName.LibraryRehash,
+        data: { target: ChecksumRehashTarget.Upload },
+      });
+      return;
+    }
+
+    if (dto.libraryId) {
+      const library = await this.findOrFail(dto.libraryId);
+      this.logger.log(`Queueing checksum recomputation for library ${library.id} using ${checksum.external}`);
+      await this.jobRepository.queue({
+        name: JobName.LibraryRehash,
+        data: { target: ChecksumRehashTarget.External, libraryId: library.id },
+      });
+      return;
+    }
+
+    const libraries = await this.libraryRepository.getAll(false);
+    this.logger.log(
+      `Queueing checksum recomputation for ${libraries.length} external library(ies) using ${checksum.external}`,
+    );
+    await this.jobRepository.queueAll(
+      libraries.map((library) => ({
+        name: JobName.LibraryRehash,
+        data: { target: ChecksumRehashTarget.External, libraryId: library.id },
+      })),
+    );
+  }
+
+  @OnJob({ name: JobName.LibraryRehash, queue: QueueName.Library })
+  async handleRehashChecksums(job: JobOf<JobName.LibraryRehash>): Promise<JobStatus> {
+    const {
+      library: { checksum },
+    } = await this.getConfig({ withCache: true });
+    const isExternal = job.target === ChecksumRehashTarget.External;
+    const algorithm = isExternal ? checksum.external : ChecksumAlgorithm.sha1File;
+    const source = isExternal ? `library ${job.libraryId ?? '(all)'}` : 'uploaded assets';
+    const assets = isExternal
+      ? job.libraryId
+        ? this.assetRepository.streamChecksums({ libraryId: job.libraryId })
+        : this.assetRepository.streamChecksums({ external: true })
+      : this.assetRepository.streamChecksums({ uploaded: true });
+
+    this.logger.log(`Starting checksum recomputation for ${source} using ${algorithm}`);
+
+    let checked = 0;
+    let updated = 0;
+    let skipped = 0;
+    let failed = 0;
+    let conflicts = 0;
+
+    for await (const batch of batched(assets, JOBS_LIBRARY_PAGINATION_SIZE)) {
+      for (const asset of batch) {
+        checked++;
+        try {
+          const checksum =
+            algorithm === ChecksumAlgorithm.sha1File
+              ? await this.cryptoRepository.hashFile(asset.originalPath)
+              : this.cryptoRepository.hashSha1(`path:${asset.originalPath}`);
+
+          if (asset.checksumAlgorithm === algorithm && asset.checksum.equals(checksum)) {
+            skipped++;
+            continue;
+          }
+
+          await this.assetRepository.updateChecksum(asset.id, checksum, algorithm);
+          updated++;
+        } catch (error) {
+          if (isAssetChecksumConstraint(error)) {
+            conflicts++;
+            continue;
+          }
+
+          failed++;
+          this.logger.warn(`Unable to recompute checksum for asset ${asset.id} (${asset.originalPath}): ${error}`);
+        }
+      }
+
+      this.logger.log(
+        `Checksum recomputation for ${source}: ${checked} checked, ${updated} updated, ${skipped} unchanged, ${conflicts} duplicate conflicts, ${failed} failed`,
+      );
+    }
+
+    this.logger.log(
+      `Finished checksum recomputation for ${source}: ${checked} checked, ${updated} updated, ${skipped} unchanged, ${conflicts} duplicate conflicts, ${failed} failed`,
+    );
+
+    return JobStatus.Success;
   }
 
   async queuePostSyncJobs(assetIds: string[]) {

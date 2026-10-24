@@ -1,0 +1,175 @@
+name: Release
+
+# Builds the Android APK and publishes a GitHub release on this fork.
+#
+# Triggers:
+#   - pushing a tag like v3.3.0 (creates the release automatically)
+#   - manual dispatch (build the APK and create/update the release for the given tag)
+#
+# Signing:
+#   - if the KEY_JKS / ALIAS / ANDROID_KEY_PASSWORD / ANDROID_STORE_PASSWORD
+#     secrets exist, the APK is signed with that keystore
+#   - otherwise Gradle falls back to the debug keystore, which is still installable
+#     (you must uninstall the Play Store build first because the signature differs)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (for example v3.3.0)'
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build-apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up mise
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          install: true
+          cache: true
+          install_args: --locked
+          persist_github_token: true
+          version: 2026.10.5
+
+      - name: Install mobile toolchain
+        working-directory: mobile
+        run: mise install --locked
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - name: Decode signing keystore
+        env:
+          KEY_JKS: ${{ secrets.KEY_JKS }}
+        run: |
+          if [ -n "$KEY_JKS" ]; then
+            printf '%s' "$KEY_JKS" | base64 -d > mobile/android/key.jks
+            echo "Using the repository signing keystore"
+          else
+            echo "KEY_JKS is empty, Gradle will fall back to the debug keystore"
+          fi
+
+      - name: Install dependencies
+        run: mise //mobile:install:ci
+
+      - name: Install root tooling
+        run: pnpm install --frozen-lockfile --filter .
+
+      - name: Generate code
+        run: mise //mobile:codegen
+
+      - name: Build release APK
+        working-directory: mobile
+        env:
+          ALIAS: ${{ secrets.ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+        run: |
+          flutter build apk --release \
+            --build-name="${TAG#v}" \
+            --build-number="${GITHUB_RUN_NUMBER}"
+
+      - name: Rename APK
+        env:
+          TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+        run: |
+          mkdir -p dist
+          cp mobile/build/app/outputs/flutter-apk/app-release.apk "dist/immich-${TAG}.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immich-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    needs: build-apk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: immich-apk
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG" =~ ^v[0-9] ]]; then
+            echo "::error::release tag must look like v3.3.0 (got: $TAG)"
+            exit 1
+          fi
+
+          prerelease=()
+          if [[ "$TAG" == *-rc.* ]]; then
+            prerelease=(--prerelease)
+          fi
+
+          assets=(
+            dist/*.apk
+            docker/docker-compose.yml
+            docker/docker-compose.rootless.yml
+            docker/example.env
+            docker/hwaccel.ml.yml
+            docker/hwaccel.transcoding.yml
+            docker/prometheus.yml
+          )
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, updating assets"
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --generate-notes \
+              "${prerelease[@]}" \
+              "${assets[@]}"
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### Release published"
+            echo ""
+            echo "- APK: \`dist/immich-${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}.apk\`"
+            echo "- Docker images: run the **Docker** workflow for the same tag"
+          } >> "$GITHUB_STEP_SUMMARY"

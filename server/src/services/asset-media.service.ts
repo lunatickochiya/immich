@@ -50,7 +50,14 @@ export class AssetMediaService extends BaseService {
 
     await this.requireAccess({ auth, permission: Permission.AssetUpload, ids: [auth.user.id] });
 
-    const assetId = await this.assetRepository.getUploadAssetIdByChecksum(auth.user.id, fromChecksum(checksum));
+    const {
+      library: { checksum: checksumConfig },
+    } = await this.getConfig({ withCache: true });
+    const assetId = await this.assetRepository.getUploadAssetIdByChecksum(
+      auth.user.id,
+      fromChecksum(checksum),
+      checksumConfig.dedupeUploadsAgainstLibraries && !auth.sharedLink,
+    );
     if (!assetId) {
       return;
     }
@@ -140,6 +147,24 @@ export class AssetMediaService extends BaseService {
       });
 
       this.requireQuota(auth, file.size);
+
+      const {
+        library: { checksum: checksumConfig },
+      } = await this.getConfig({ withCache: true });
+      if (!auth.sharedLink && checksumConfig.dedupeUploadsAgainstLibraries) {
+        const duplicate = await this.assetRepository.getLibraryContentChecksumMatch(auth.user.id, file.checksum);
+        if (duplicate) {
+          await this.jobRepository.queue({
+            name: JobName.FileDelete,
+            data: { files: [file.originalPath, sidecarFile?.originalPath] },
+          });
+
+          this.logger.debug(
+            `Duplicate asset upload rejected: content already exists in library ${duplicate.libraryId}`,
+          );
+          return { status: AssetMediaStatus.DUPLICATE, id: duplicate.id };
+        }
+      }
 
       if (dto.livePhotoVideoId) {
         await onBeforeLink(
@@ -306,8 +331,15 @@ export class AssetMediaService extends BaseService {
   }
 
   async bulkUploadCheck(auth: AuthDto, dto: AssetBulkUploadCheckDto): Promise<AssetBulkUploadCheckResponseDto> {
+    const {
+      library: { checksum },
+    } = await this.getConfig({ withCache: true });
     const checksums: Buffer[] = dto.assets.map((asset) => fromChecksum(asset.checksum));
-    const results = await this.assetRepository.getByChecksums(auth.user.id, checksums);
+    const results = await this.assetRepository.getByChecksums(
+      auth.user.id,
+      checksums,
+      checksum.dedupeUploadsAgainstLibraries && !auth.sharedLink,
+    );
     const checksumMap: Record<string, { id: string; isTrashed: boolean }> = {};
 
     for (const { id, deletedAt, checksum } of results) {

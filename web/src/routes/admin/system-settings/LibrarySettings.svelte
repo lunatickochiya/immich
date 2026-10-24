@@ -10,7 +10,10 @@
   import { SettingInputFieldType } from '$lib/constants';
   import FormatMessage from '$lib/elements/FormatMessage.svelte';
   import { featureFlagsManager } from '$lib/managers/feature-flags-manager.svelte';
-  import { Link } from '@immich/ui';
+  import { handleError } from '$lib/utils/handle-error';
+  import { ChecksumAlgorithm, ChecksumRehashTarget, recomputeChecksums } from '@immich/sdk';
+  import { Button, Link, modalManager, toastManager } from '@immich/ui';
+  import { mdiDatabaseRefreshOutline } from '@mdi/js';
   import { t } from 'svelte-i18n';
   import { fade } from 'svelte/transition';
 
@@ -26,12 +29,112 @@
     { text: $t('interval.day_at_onepm'), value: '0 13 * * *' },
     { text: $t('interval.hours', { values: { hours: 6 } }), value: '0 */6 * * *' },
   ]);
+
+  const checksumOptions = $derived([
+    { value: ChecksumAlgorithm.Sha1, text: $t('admin.checksum_content_sha1') },
+    { value: ChecksumAlgorithm.Sha1Path, text: $t('admin.checksum_path_sha1') },
+  ]);
+
+  const checksumSettingsChanged = $derived(
+    configToEdit.library.checksum.external !== config.library.checksum.external ||
+      configToEdit.library.checksum.dedupeUploadsAgainstLibraries !==
+        config.library.checksum.dedupeUploadsAgainstLibraries,
+  );
+
+  const handleRecompute = async (target: ChecksumRehashTarget) => {
+    const confirmed = await modalManager.showDialog({
+      icon: mdiDatabaseRefreshOutline,
+      title: $t('admin.recompute_checksums'),
+      prompt:
+        target === ChecksumRehashTarget.External
+          ? $t('admin.recompute_external_checksums_prompt')
+          : $t('admin.recompute_upload_checksums_prompt'),
+      confirmText: $t('admin.recompute_checksums'),
+      confirmColor: 'primary',
+    });
+
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      await recomputeChecksums({ recomputeChecksumsDto: { target } });
+      toastManager.info($t('admin.recompute_checksums_queued'));
+    } catch (error) {
+      handleError(error, $t('errors.something_went_wrong'));
+    }
+  };
 </script>
 
 <div>
   <div in:fade={{ duration: 500 }}>
     <form autocomplete="off" onsubmit={(event) => event.preventDefault()}>
       <div class="ms-4 mt-4 flex flex-col gap-4">
+        <SettingAccordion
+          key="library-checksums"
+          title={$t('admin.library_checksum_settings')}
+          subtitle={$t('admin.library_checksum_settings_description')}
+        >
+          <div class="ms-4 mt-4 flex flex-col gap-4">
+            <SettingSelect
+              name="external-checksum"
+              label={$t('admin.library_external_checksum')}
+              desc={$t('admin.library_external_checksum_description')}
+              options={checksumOptions}
+              bind:value={configToEdit.library.checksum.external}
+              {disabled}
+              isEdited={configToEdit.library.checksum.external !== config.library.checksum.external}
+            />
+
+            <SettingSelect
+              name="upload-checksum"
+              label={$t('admin.library_upload_checksum')}
+              desc={$t('admin.library_upload_checksum_description')}
+              options={[{ value: ChecksumAlgorithm.Sha1, text: $t('admin.checksum_content_sha1') }]}
+              value={ChecksumAlgorithm.Sha1}
+              disabled={true}
+            />
+
+            <SettingSwitch
+              title={$t('admin.library_dedupe_uploads')}
+              subtitle={$t('admin.library_dedupe_uploads_description')}
+              bind:checked={configToEdit.library.checksum.dedupeUploadsAgainstLibraries}
+              {disabled}
+              isEdited={configToEdit.library.checksum.dedupeUploadsAgainstLibraries !==
+                config.library.checksum.dedupeUploadsAgainstLibraries}
+            />
+
+            <div class="flex flex-wrap gap-2">
+              <Button
+                size="small"
+                variant="ghost"
+                shape="round"
+                disabled={disabled || checksumSettingsChanged}
+                onclick={() => handleRecompute(ChecksumRehashTarget.External)}
+              >
+                {$t('admin.recompute_external_checksums')}
+              </Button>
+              <Button
+                size="small"
+                variant="ghost"
+                shape="round"
+                disabled={disabled || checksumSettingsChanged}
+                onclick={() => handleRecompute(ChecksumRehashTarget.Upload)}
+              >
+                {$t('admin.recompute_upload_checksums')}
+              </Button>
+            </div>
+
+            {#if checksumSettingsChanged}
+              <p class="text-sm text-orange-600 dark:text-orange-400">
+                {$t('admin.recompute_checksums_unsaved')}
+              </p>
+            {/if}
+
+            <p class="text-sm dark:text-immich-dark-fg">{$t('admin.recompute_checksums_description')}</p>
+          </div>
+        </SettingAccordion>
+
         <SettingAccordion
           key="library-watching"
           title={$t('admin.library_watching_settings')}
