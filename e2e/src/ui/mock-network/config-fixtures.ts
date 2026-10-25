@@ -156,7 +156,11 @@ export const adminConfig = {
   },
   trash: { enabled: true, days: 30 },
   theme: { customCss: '' },
-  library: { scan: { enabled: true, cronExpression: '0 0 * * *' }, watch: { enabled: false } },
+  library: {
+    scan: { enabled: true, cronExpression: '0 0 * * *' },
+    watch: { enabled: false },
+    checksum: { external: 'sha1-path', dedupeUploadsAgainstLibraries: true },
+  },
   server: { externalDomain: '', loginPageMessage: '', publicUsers: true },
   notifications: {
     smtp: {
