@@ -446,25 +446,56 @@ open class NativeSyncApiImplBase(context: Context) : ImmichPlugin(), ActivityAwa
 
   private suspend fun hashAsset(assetId: String): HashResult {
     return try {
-      val digest = MessageDigest.getInstance("SHA-1")
-      openOriginalStream(assetId).use { inputStream ->
-        val buffer = ByteArray(HASH_BUFFER_SIZE)
-        while (true) {
-          val bytesRead = inputStream.read(buffer)
-          if (bytesRead == -1) break
-          currentCoroutineContext().ensureActive()
-          digest.update(buffer, 0, bytesRead)
-        }
-      }
-
-      HashResult(assetId, null, Base64.encodeToString(digest.digest(), Base64.NO_WRAP))
+      HashResult(assetId, null, hashBytes { openOriginalStream(assetId) })
     } catch (e: CancellationException) {
       throw e
     } catch (e: SecurityException) {
-      HashResult(assetId, "Permission denied accessing asset: ${e.message}", null)
+      // ACCESS_MEDIA_LOCATION is not always grantable (or visible) on Android 14+ OEM ROMs.
+      // The uploader reads the asset through its MediaStore file path, so hash those same bytes
+      // instead of failing the whole backup.
+      Log.w(TAG, "ACCESS_MEDIA_LOCATION denied for asset $assetId, hashing the media file instead", e)
+      try {
+        HashResult(assetId, null, hashBytes { openMediaFileStream(assetId) })
+      } catch (fallback: CancellationException) {
+        throw fallback
+      } catch (fallback: Exception) {
+        HashResult(assetId, "Failed to hash asset: ${fallback.message}", null)
+      }
     } catch (e: Exception) {
       HashResult(assetId, "Failed to hash asset: ${e.message}", null)
     }
+  }
+
+  private suspend fun hashBytes(open: () -> InputStream): String {
+    val digest = MessageDigest.getInstance("SHA-1")
+    open().use { inputStream ->
+      val buffer = ByteArray(HASH_BUFFER_SIZE)
+      while (true) {
+        val bytesRead = inputStream.read(buffer)
+        if (bytesRead == -1) break
+        currentCoroutineContext().ensureActive()
+        digest.update(buffer, 0, bytesRead)
+      }
+    }
+
+    return Base64.encodeToString(digest.digest(), Base64.NO_WRAP)
+  }
+
+  private fun openMediaFileStream(assetId: String): InputStream {
+    val path = getCursor(
+      MediaStore.VOLUME_EXTERNAL,
+      "${MediaStore.MediaColumns._ID} = ?",
+      arrayOf(assetId),
+      arrayOf(MediaStore.MediaColumns.DATA)
+    )?.use { cursor ->
+      if (cursor.moveToFirst()) cursor.getStringOrNull(0) else null
+    }
+
+    if (path.isNullOrEmpty()) {
+      throw IOException("No media file path for asset $assetId")
+    }
+
+    return File(path).inputStream()
   }
 
   private fun openOriginalStream(assetId: String): InputStream {
