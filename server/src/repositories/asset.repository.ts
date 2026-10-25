@@ -25,6 +25,7 @@ import {
   AssetType,
   AssetVisibility,
   CalendarHeatmapType,
+  ChecksumAlgorithm,
 } from 'src/enum.js';
 import { DB } from 'src/schema/index.js';
 import { AssetAudioTable, AssetKeyframeTable, AssetVideoTable } from 'src/schema/tables/asset-av.table.js';
@@ -670,23 +671,67 @@ export class AssetRepository {
   }
 
   @GenerateSql({ params: [DummyValue.UUID, [DummyValue.BUFFER]] })
-  getByChecksums(userId: string, checksums: Buffer[]) {
+  getByChecksums(userId: string, checksums: Buffer[], includeLibraries = true) {
     return this.db
       .selectFrom('asset')
       .select(['id', 'checksum', 'deletedAt'])
       .where('ownerId', '=', asUuid(userId))
       .where('checksum', 'in', checksums)
+      .$if(!includeLibraries, (qb) => qb.where('libraryId', 'is', null))
       .execute();
   }
 
+  getLibraryContentChecksumMatch(ownerId: string, checksum: Buffer) {
+    return this.db
+      .selectFrom('asset')
+      .select(['id', 'libraryId'])
+      .where('ownerId', '=', asUuid(ownerId))
+      .where('libraryId', 'is not', null)
+      .where('checksum', '=', checksum)
+      .where('checksumAlgorithm', '=', ChecksumAlgorithm.sha1File)
+      .where('deletedAt', 'is', null)
+      .where('isOffline', '=', false)
+      .limit(1)
+      .executeTakeFirst();
+  }
+
+  getLibraryChecksums(ownerId: string, libraryId: string, checksums: Buffer[]) {
+    return this.db
+      .selectFrom('asset')
+      .select('checksum')
+      .where('ownerId', '=', asUuid(ownerId))
+      .where('libraryId', '=', asUuid(libraryId))
+      .where('checksum', 'in', checksums)
+      .execute()
+      .then((rows) => rows.map((row) => row.checksum));
+  }
+
+  streamChecksums({ libraryId, external, uploaded }: { libraryId?: string; external?: boolean; uploaded?: boolean }) {
+    return this.db
+      .selectFrom('asset')
+      .select(['id', 'originalPath', 'checksum', 'checksumAlgorithm'])
+      .$if(!!libraryId, (qb) => qb.where('libraryId', '=', asUuid(libraryId!)))
+      .$if(!libraryId && !!external, (qb) => qb.where('libraryId', 'is not', null))
+      .$if(!libraryId && !!uploaded, (qb) => qb.where('libraryId', 'is', null))
+      .stream();
+  }
+
+  updateChecksum(id: string, checksum: Buffer, checksumAlgorithm: ChecksumAlgorithm) {
+    return this.db.updateTable('asset').set({ checksum, checksumAlgorithm }).where('id', '=', asUuid(id)).execute();
+  }
+
   @GenerateSql({ params: [DummyValue.UUID, DummyValue.BUFFER] })
-  async getUploadAssetIdByChecksum(ownerId: string, checksum: Buffer): Promise<string | undefined> {
+  async getUploadAssetIdByChecksum(
+    ownerId: string,
+    checksum: Buffer,
+    includeLibraries = false,
+  ): Promise<string | undefined> {
     const asset = await this.db
       .selectFrom('asset')
       .select('id')
       .where('ownerId', '=', asUuid(ownerId))
       .where('checksum', '=', checksum)
-      .where('libraryId', 'is', null)
+      .$if(!includeLibraries, (qb) => qb.where('libraryId', 'is', null))
       .limit(1)
       .executeTakeFirst();
 

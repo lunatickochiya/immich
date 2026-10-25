@@ -4,6 +4,7 @@ import { SystemConfig, defaults } from 'src/dtos/config.dto.js';
 import {
   AudioCodec,
   CQMode,
+  ChecksumAlgorithm,
   Colorspace,
   HlsVideoResolution,
   ImageFormat,
@@ -230,6 +231,10 @@ const updatedConfig = Object.freeze<SystemConfig>({
     },
     watch: {
       enabled: false,
+    },
+    checksum: {
+      external: ChecksumAlgorithm.sha1Path,
+      dedupeUploadsAgainstLibraries: true,
     },
   },
   user: {

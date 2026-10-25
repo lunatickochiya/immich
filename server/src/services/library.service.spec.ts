@@ -5,7 +5,15 @@ import type { ILibraryBulkIdsJob, ILibraryFileJob } from 'src/types.js';
 import { JOBS_LIBRARY_PAGINATION_SIZE } from 'src/constants.js';
 import { SystemConfig, defaults } from 'src/dtos/config.dto.js';
 import { mapLibrary } from 'src/dtos/library.dto.js';
-import { AssetType, CronJob, ImmichWorker, JobName, JobStatus } from 'src/enum.js';
+import {
+  AssetType,
+  ChecksumAlgorithm,
+  ChecksumRehashTarget,
+  CronJob,
+  ImmichWorker,
+  JobName,
+  JobStatus,
+} from 'src/enum.js';
 import { LibraryService } from 'src/services/library.service.js';
 import { AssetFactory } from 'test/factories/asset.factory.js';
 import { authStub } from 'test/fixtures/auth.stub.js';
@@ -606,6 +614,161 @@ describe(LibraryService.name, () => {
       await expect(sut.handleSyncFiles(mockLibraryJob)).resolves.toBe(JobStatus.Failed);
 
       expect(mocks.asset.createAll.mock.calls).toEqual([]);
+    });
+
+    it('should use content checksums when configured', async () => {
+      const library = factory.library();
+      const asset = AssetFactory.create();
+      const checksum = Buffer.from('content-checksum');
+
+      mocks.systemMetadata.get.mockResolvedValue({
+        library: { checksum: { external: ChecksumAlgorithm.sha1File, dedupeUploadsAgainstLibraries: true } },
+      });
+      mocks.crypto.hashFile.mockResolvedValue(checksum);
+      mocks.asset.getLibraryChecksums.mockResolvedValue([]);
+      mocks.asset.createAll.mockResolvedValue([asset.id]);
+      mocks.library.get.mockResolvedValue(library);
+
+      await expect(sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/photo.jpg'] })).resolves.toBe(
+        JobStatus.Success,
+      );
+
+      expect(mocks.crypto.hashFile).toHaveBeenCalledWith('/data/user1/photo.jpg');
+      expect(mocks.asset.createAll).toHaveBeenCalledWith([
+        expect.objectContaining({ checksum, checksumAlgorithm: ChecksumAlgorithm.sha1File }),
+      ]);
+    });
+
+    it('should skip files whose content checksum already exists in the library', async () => {
+      const library = factory.library();
+      const asset = AssetFactory.create();
+      const checksum = Buffer.from('content-checksum');
+
+      mocks.systemMetadata.get.mockResolvedValue({
+        library: { checksum: { external: ChecksumAlgorithm.sha1File, dedupeUploadsAgainstLibraries: true } },
+      });
+      mocks.crypto.hashFile.mockResolvedValue(checksum);
+      mocks.asset.getLibraryChecksums.mockResolvedValue([checksum]);
+      mocks.asset.createAll.mockResolvedValue([asset.id]);
+      mocks.library.get.mockResolvedValue(library);
+
+      await expect(sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/photo.jpg'] })).resolves.toBe(
+        JobStatus.Success,
+      );
+
+      expect(mocks.asset.createAll).toHaveBeenCalledWith([]);
+    });
+  });
+
+  describe('handleRehashChecksums', () => {
+    it('should rehash uploaded assets with content checksums', async () => {
+      const asset = AssetFactory.create({ originalPath: '/data/upload/photo.jpg' });
+      const checksum = Buffer.from('new-checksum');
+
+      async function* stream() {
+        // eslint-disable-next-line unicorn/no-useless-promise-resolve-reject
+        yield await Promise.resolve({
+          id: asset.id,
+          originalPath: asset.originalPath,
+          checksum: Buffer.from('old-checksum'),
+          checksumAlgorithm: ChecksumAlgorithm.sha1Path,
+        });
+      }
+
+      mocks.asset.streamChecksums.mockReturnValue(stream());
+      mocks.crypto.hashFile.mockResolvedValue(checksum);
+
+      await expect(sut.handleRehashChecksums({ target: ChecksumRehashTarget.Upload })).resolves.toBe(JobStatus.Success);
+
+      expect(mocks.asset.streamChecksums).toHaveBeenCalledWith({ uploaded: true });
+      expect(mocks.crypto.hashFile).toHaveBeenCalledWith(asset.originalPath);
+      expect(mocks.asset.updateChecksum).toHaveBeenCalledWith(asset.id, checksum, ChecksumAlgorithm.sha1File);
+    });
+
+    it('should skip assets that already match the configured algorithm', async () => {
+      const asset = AssetFactory.create({ originalPath: '/library/photo.jpg' });
+      const checksum = Buffer.from('same-checksum');
+
+      async function* stream() {
+        // eslint-disable-next-line unicorn/no-useless-promise-resolve-reject
+        yield await Promise.resolve({
+          id: asset.id,
+          originalPath: asset.originalPath,
+          checksum,
+          checksumAlgorithm: ChecksumAlgorithm.sha1Path,
+        });
+      }
+
+      mocks.asset.streamChecksums.mockReturnValue(stream());
+      mocks.crypto.hashSha1.mockReturnValue(checksum);
+
+      await expect(
+        sut.handleRehashChecksums({ target: ChecksumRehashTarget.External, libraryId: asset.libraryId ?? undefined }),
+      ).resolves.toBe(JobStatus.Success);
+
+      expect(mocks.asset.updateChecksum).not.toHaveBeenCalled();
+    });
+
+    it('should count duplicate checksum conflicts without failing', async () => {
+      const asset = AssetFactory.create({ originalPath: '/library/photo.jpg' });
+      const checksum = Buffer.from('conflict-checksum');
+
+      async function* stream() {
+        // eslint-disable-next-line unicorn/no-useless-promise-resolve-reject
+        yield await Promise.resolve({
+          id: asset.id,
+          originalPath: asset.originalPath,
+          checksum: Buffer.from('old-checksum'),
+          checksumAlgorithm: ChecksumAlgorithm.sha1Path,
+        });
+      }
+
+      mocks.asset.streamChecksums.mockReturnValue(stream());
+      mocks.crypto.hashFile.mockResolvedValue(checksum);
+      mocks.asset.updateChecksum.mockRejectedValue({
+        constraint_name: 'UQ_assets_owner_library_checksum',
+      });
+
+      await expect(sut.handleRehashChecksums({ target: ChecksumRehashTarget.Upload })).resolves.toBe(JobStatus.Success);
+
+      expect(mocks.asset.updateChecksum).toHaveBeenCalled();
+    });
+  });
+
+  describe('queueRecomputeChecksums', () => {
+    it('should queue an upload rehash job', async () => {
+      await sut.queueRecomputeChecksums({ target: ChecksumRehashTarget.Upload });
+
+      expect(mocks.job.queue).toHaveBeenCalledWith({
+        name: JobName.LibraryRehash,
+        data: { target: ChecksumRehashTarget.Upload },
+      });
+    });
+
+    it('should queue a rehash job for a single library', async () => {
+      const library = factory.library();
+      mocks.library.get.mockResolvedValue(library);
+
+      await sut.queueRecomputeChecksums({ target: ChecksumRehashTarget.External, libraryId: library.id });
+
+      expect(mocks.job.queue).toHaveBeenCalledWith({
+        name: JobName.LibraryRehash,
+        data: { target: ChecksumRehashTarget.External, libraryId: library.id },
+      });
+    });
+
+    it('should queue rehash jobs for all libraries', async () => {
+      const libraries = [factory.library(), factory.library()];
+      mocks.library.getAll.mockResolvedValue(libraries);
+
+      await sut.queueRecomputeChecksums({ target: ChecksumRehashTarget.External });
+
+      expect(mocks.job.queueAll).toHaveBeenCalledWith(
+        libraries.map((library) => ({
+          name: JobName.LibraryRehash,
+          data: { target: ChecksumRehashTarget.External, libraryId: library.id },
+        })),
+      );
     });
   });
 

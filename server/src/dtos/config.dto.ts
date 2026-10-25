@@ -8,6 +8,8 @@ import {
   AudioCodecSchema,
   CQMode,
   CQModeSchema,
+  ChecksumAlgorithm,
+  ChecksumAlgorithmSchema,
   Colorspace,
   ColorspaceSchema,
   ConfigVisibility,
@@ -418,6 +420,16 @@ const AdminConfigSchemaWithVisibility = z
           })
           .meta({ id: 'AdminConfigLibraryScanDto' }),
         watch: z.object({ enabled: configBool.describe('Enabled') }).meta({ id: 'AdminConfigLibraryWatchDto' }),
+        checksum: z
+          .object({
+            external: ChecksumAlgorithmSchema.describe(
+              'Checksum algorithm used when importing assets from external libraries',
+            ),
+            dedupeUploadsAgainstLibraries: configBool.describe(
+              'Treat an upload as a duplicate when an external library asset has the same content checksum',
+            ),
+          })
+          .meta({ id: 'AdminConfigLibraryChecksumDto' }),
       })
       .meta({ id: 'AdminConfigLibraryDto' }),
     notifications: z.object({ smtp: AdminConfigSmtpSchema }).meta({ id: 'AdminConfigNotificationsDto' }),
@@ -784,6 +796,10 @@ export const defaults = Object.freeze<SystemConfig>({
     },
     watch: {
       enabled: false,
+    },
+    checksum: {
+      external: ChecksumAlgorithm.sha1Path,
+      dedupeUploadsAgainstLibraries: true,
     },
   },
   server: {
