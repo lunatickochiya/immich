@@ -1,0 +1,930 @@
+From e4fa2446b81f4c65640126c4e0b0933c0a7d379f Mon Sep 17 00:00:00 2001
+From: lunatickochiya <125438787@qq.com>
+Date: Sun, 25 Oct 2026 14:08:43 +0800
+Subject: [PATCH 2/5] feat(server): configurable library checksums and rehash
+ job
+
+- add library.checksum.external (sha1-path | sha1) and
+  library.checksum.dedupeUploadsAgainstLibraries to the admin config
+- hash external library imports with the configured algorithm and skip
+  duplicate content inside a library, including concurrent import races
+- de-duplicate uploads against external library assets on upload,
+  checksum preflight and bulk upload checks
+- add LibraryRehash job + POST /libraries/recompute-checksums to migrate
+  existing assets, skipping unique checksum conflicts
+---
+ server/src/controllers/index.spec.ts          |   1 +
+ server/src/controllers/library.controller.ts  |  14 ++
+ server/src/dtos/config.dto.ts                 |  16 ++
+ server/src/dtos/library.dto.ts                |   9 +
+ server/src/enum.ts                            |  15 ++
+ server/src/repositories/asset.repository.ts   |  51 ++++-
+ .../src/services/asset-media.service.spec.ts  |  34 +++-
+ server/src/services/asset-media.service.ts    |  36 +++-
+ server/src/services/library.service.spec.ts   | 165 +++++++++++++++-
+ server/src/services/library.service.ts        | 183 +++++++++++++++++-
+ .../services/system-config.service.spec.ts    |   5 +
+ server/src/types.ts                           |   7 +
+ server/src/utils/database.ts                  |   7 +-
+ .../repositories/asset.repository.mock.ts     |   4 +
+ 14 files changed, 529 insertions(+), 18 deletions(-)
+
+diff --git a/server/src/controllers/index.spec.ts b/server/src/controllers/index.spec.ts
+index e156e01b0..3862c8cce 100644
+--- a/server/src/controllers/index.spec.ts
++++ b/server/src/controllers/index.spec.ts
+@@ -35,6 +35,7 @@ const ADMIN_ROUTES = new Set([
+   'POST libraries',
+   'POST libraries/:id/scan',
+   'POST libraries/:id/validate',
++  'POST libraries/recompute-checksums',
+   'POST system-metadata/admin-onboarding',
+   'PUT jobs/:name',
+   'PUT libraries/:id',
+diff --git a/server/src/controllers/library.controller.ts b/server/src/controllers/library.controller.ts
+index 7a4992e6d..acf964074 100644
+--- a/server/src/controllers/library.controller.ts
++++ b/server/src/controllers/library.controller.ts
+@@ -5,6 +5,7 @@ import {
+   CreateLibraryDto,
+   LibraryResponseDto,
+   LibraryStatsResponseDto,
++  RecomputeChecksumsDto,
+   UpdateLibraryDto,
+   ValidateLibraryDto,
+   ValidateLibraryResponseDto,
+@@ -82,6 +83,19 @@ export class LibraryController {
+     return this.service.delete(id);
+   }
+ 
++  @Post('recompute-checksums')
++  @Authenticated({ permission: Permission.LibraryUpdate, admin: true })
++  @HttpCode(HttpStatus.NO_CONTENT)
++  @Endpoint({
++    summary: 'Recompute asset checksums',
++    description:
++      'Queue a background job that recomputes asset checksums. External libraries use the configured checksum algorithm, uploads always use the content SHA-1.',
++    history: new HistoryBuilder().added('v3.3.0').beta('v3.3.0'),
++  })
++  recomputeChecksums(@Body() dto: RecomputeChecksumsDto): Promise<void> {
++    return this.service.queueRecomputeChecksums(dto);
++  }
++
+   @Post(':id/validate')
+   @Authenticated({ admin: true })
+   @HttpCode(HttpStatus.OK)
+diff --git a/server/src/dtos/config.dto.ts b/server/src/dtos/config.dto.ts
+index 63620b7d0..e87b7a95d 100644
+--- a/server/src/dtos/config.dto.ts
++++ b/server/src/dtos/config.dto.ts
+@@ -8,6 +8,8 @@ import {
+   AudioCodecSchema,
+   CQMode,
+   CQModeSchema,
++  ChecksumAlgorithm,
++  ChecksumAlgorithmSchema,
+   Colorspace,
+   ColorspaceSchema,
+   ConfigVisibility,
+@@ -418,6 +420,16 @@ const AdminConfigSchemaWithVisibility = z
+           })
+           .meta({ id: 'AdminConfigLibraryScanDto' }),
+         watch: z.object({ enabled: configBool.describe('Enabled') }).meta({ id: 'AdminConfigLibraryWatchDto' }),
++        checksum: z
++          .object({
++            external: ChecksumAlgorithmSchema.describe(
++              'Checksum algorithm used when importing assets from external libraries',
++            ),
++            dedupeUploadsAgainstLibraries: configBool.describe(
++              'Treat an upload as a duplicate when an external library asset has the same content checksum',
++            ),
++          })
++          .meta({ id: 'AdminConfigLibraryChecksumDto' }),
+       })
+       .meta({ id: 'AdminConfigLibraryDto' }),
+     notifications: z.object({ smtp: AdminConfigSmtpSchema }).meta({ id: 'AdminConfigNotificationsDto' }),
+@@ -785,6 +797,10 @@ export const defaults = Object.freeze<SystemConfig>({
+     watch: {
+       enabled: false,
+     },
++    checksum: {
++      external: ChecksumAlgorithm.sha1Path,
++      dedupeUploadsAgainstLibraries: true,
++    },
+   },
+   server: {
+     externalDomain: '',
+diff --git a/server/src/dtos/library.dto.ts b/server/src/dtos/library.dto.ts
+index 0aa4a03d3..5c6ac362e 100644
+--- a/server/src/dtos/library.dto.ts
++++ b/server/src/dtos/library.dto.ts
+@@ -1,6 +1,7 @@
+ import { createZodDto } from 'nestjs-zod';
+ import z from 'zod';
+ import { Library } from 'src/database.js';
++import { ChecksumRehashTargetSchema } from 'src/enum.js';
+ import { isoDatetimeToDate } from 'src/validation.js';
+ 
+ const stringArrayMax128 = z
+@@ -83,6 +84,13 @@ const LibraryStatsResponseSchema = z
+   })
+   .meta({ id: 'LibraryStatsResponseDto' });
+ 
++const RecomputeChecksumsSchema = z
++  .object({
++    target: ChecksumRehashTargetSchema,
++    libraryId: z.uuidv4().optional().describe('Only recompute checksums for this external library'),
++  })
++  .meta({ id: 'RecomputeChecksumsDto' });
++
+ export class CreateLibraryDto extends createZodDto(CreateLibrarySchema) {}
+ export class UpdateLibraryDto extends createZodDto(UpdateLibrarySchema) {}
+ export class ValidateLibraryDto extends createZodDto(ValidateLibrarySchema) {}
+@@ -90,6 +98,7 @@ export class ValidateLibraryResponseDto extends createZodDto(ValidateLibraryResp
+ export class ValidateLibraryImportPathResponseDto extends createZodDto(ValidateLibraryImportPathResponseSchema) {}
+ export class LibraryResponseDto extends createZodDto(LibraryResponseSchema) {}
+ export class LibraryStatsResponseDto extends createZodDto(LibraryStatsResponseSchema) {}
++export class RecomputeChecksumsDto extends createZodDto(RecomputeChecksumsSchema) {}
+ 
+ export function mapLibrary(entity: Library): LibraryResponseDto {
+   const assetCount = entity.assets ? entity.assets.length : 0;
+diff --git a/server/src/enum.ts b/server/src/enum.ts
+index 5208eac40..5efe4bc03 100644
+--- a/server/src/enum.ts
++++ b/server/src/enum.ts
+@@ -58,6 +58,20 @@ export enum ChecksumAlgorithm {
+   sha1Path = 'sha1-path',
+ }
+ 
++export const ChecksumAlgorithmSchema = z.enum(ChecksumAlgorithm).describe('Checksum algorithm').meta({
++  id: 'ChecksumAlgorithm',
++});
++
++export enum ChecksumRehashTarget {
++  External = 'external',
++  Upload = 'upload',
++}
++
++export const ChecksumRehashTargetSchema = z
++  .enum(ChecksumRehashTarget)
++  .describe('Which assets to recompute checksums for')
++  .meta({ id: 'ChecksumRehashTarget' });
++
+ export enum AssetFileType {
+   /**
+    * An full/large-size image extracted/converted from RAW photos
+@@ -920,6 +934,7 @@ export enum JobName {
+   LibrarySyncFilesQueueAll = 'LibrarySyncFilesQueueAll',
+   LibrarySyncFiles = 'LibrarySyncFiles',
+   LibraryScanQueueAll = 'LibraryScanQueueAll',
++  LibraryRehash = 'LibraryRehash',
+ 
+   HlsSessionCleanup = 'HlsSessionCleanup',
+ 
+diff --git a/server/src/repositories/asset.repository.ts b/server/src/repositories/asset.repository.ts
+index ca00c027e..fb5e49b23 100644
+--- a/server/src/repositories/asset.repository.ts
++++ b/server/src/repositories/asset.repository.ts
+@@ -25,6 +25,7 @@ import {
+   AssetType,
+   AssetVisibility,
+   CalendarHeatmapType,
++  ChecksumAlgorithm,
+ } from 'src/enum.js';
+ import { DB } from 'src/schema/index.js';
+ import { AssetAudioTable, AssetKeyframeTable, AssetVideoTable } from 'src/schema/tables/asset-av.table.js';
+@@ -670,23 +671,67 @@ export class AssetRepository {
+   }
+ 
+   @GenerateSql({ params: [DummyValue.UUID, [DummyValue.BUFFER]] })
+-  getByChecksums(userId: string, checksums: Buffer[]) {
++  getByChecksums(userId: string, checksums: Buffer[], includeLibraries = true) {
+     return this.db
+       .selectFrom('asset')
+       .select(['id', 'checksum', 'deletedAt'])
+       .where('ownerId', '=', asUuid(userId))
+       .where('checksum', 'in', checksums)
++      .$if(!includeLibraries, (qb) => qb.where('libraryId', 'is', null))
+       .execute();
+   }
+ 
++  getLibraryContentChecksumMatch(ownerId: string, checksum: Buffer) {
++    return this.db
++      .selectFrom('asset')
++      .select(['id', 'libraryId'])
++      .where('ownerId', '=', asUuid(ownerId))
++      .where('libraryId', 'is not', null)
++      .where('checksum', '=', checksum)
++      .where('checksumAlgorithm', '=', ChecksumAlgorithm.sha1File)
++      .where('deletedAt', 'is', null)
++      .where('isOffline', '=', false)
++      .limit(1)
++      .executeTakeFirst();
++  }
++
++  getLibraryChecksums(ownerId: string, libraryId: string, checksums: Buffer[]) {
++    return this.db
++      .selectFrom('asset')
++      .select('checksum')
++      .where('ownerId', '=', asUuid(ownerId))
++      .where('libraryId', '=', asUuid(libraryId))
++      .where('checksum', 'in', checksums)
++      .execute()
++      .then((rows) => rows.map((row) => row.checksum));
++  }
++
++  streamChecksums({ libraryId, external, uploaded }: { libraryId?: string; external?: boolean; uploaded?: boolean }) {
++    return this.db
++      .selectFrom('asset')
++      .select(['id', 'originalPath', 'checksum', 'checksumAlgorithm'])
++      .$if(!!libraryId, (qb) => qb.where('libraryId', '=', asUuid(libraryId!)))
++      .$if(!libraryId && !!external, (qb) => qb.where('libraryId', 'is not', null))
++      .$if(!libraryId && !!uploaded, (qb) => qb.where('libraryId', 'is', null))
++      .stream();
++  }
++
++  updateChecksum(id: string, checksum: Buffer, checksumAlgorithm: ChecksumAlgorithm) {
++    return this.db.updateTable('asset').set({ checksum, checksumAlgorithm }).where('id', '=', asUuid(id)).execute();
++  }
++
+   @GenerateSql({ params: [DummyValue.UUID, DummyValue.BUFFER] })
+-  async getUploadAssetIdByChecksum(ownerId: string, checksum: Buffer): Promise<string | undefined> {
++  async getUploadAssetIdByChecksum(
++    ownerId: string,
++    checksum: Buffer,
++    includeLibraries = false,
++  ): Promise<string | undefined> {
+     const asset = await this.db
+       .selectFrom('asset')
+       .select('id')
+       .where('ownerId', '=', asUuid(ownerId))
+       .where('checksum', '=', checksum)
+-      .where('libraryId', 'is', null)
++      .$if(!includeLibraries, (qb) => qb.where('libraryId', 'is', null))
+       .limit(1)
+       .executeTakeFirst();
+ 
+diff --git a/server/src/services/asset-media.service.spec.ts b/server/src/services/asset-media.service.spec.ts
+index 729b64325..91f942be3 100644
+--- a/server/src/services/asset-media.service.spec.ts
++++ b/server/src/services/asset-media.service.spec.ts
+@@ -193,7 +193,7 @@ describe(AssetMediaService.name, () => {
+ 
+     it('should handle a non-existent asset', async () => {
+       await expect(sut.getUploadAssetIdByChecksum(authStub.admin, file1.toString('hex'))).resolves.toBeUndefined();
+-      expect(mocks.asset.getUploadAssetIdByChecksum).toHaveBeenCalledWith(authStub.admin.user.id, file1);
++      expect(mocks.asset.getUploadAssetIdByChecksum).toHaveBeenCalledWith(authStub.admin.user.id, file1, true);
+     });
+ 
+     it('should find an existing asset', async () => {
+@@ -202,7 +202,7 @@ describe(AssetMediaService.name, () => {
+         id: 'asset-id',
+         status: AssetMediaStatus.DUPLICATE,
+       });
+-      expect(mocks.asset.getUploadAssetIdByChecksum).toHaveBeenCalledWith(authStub.admin.user.id, file1);
++      expect(mocks.asset.getUploadAssetIdByChecksum).toHaveBeenCalledWith(authStub.admin.user.id, file1, true);
+     });
+ 
+     it('should find an existing asset by base64', async () => {
+@@ -211,7 +211,7 @@ describe(AssetMediaService.name, () => {
+         id: 'asset-id',
+         status: AssetMediaStatus.DUPLICATE,
+       });
+-      expect(mocks.asset.getUploadAssetIdByChecksum).toHaveBeenCalledWith(authStub.admin.user.id, file1);
++      expect(mocks.asset.getUploadAssetIdByChecksum).toHaveBeenCalledWith(authStub.admin.user.id, file1, true);
+     });
+   });
+ 
+@@ -365,6 +365,30 @@ describe(AssetMediaService.name, () => {
+       );
+     });
+ 
++    it('should deduplicate against an external library asset', async () => {
++      const file = {
++        uuid: 'random-uuid',
++        originalPath: 'fake_path/asset_1.jpeg',
++        mimeType: 'image/jpeg',
++        checksum: Buffer.from('file hash', 'utf8'),
++        originalName: 'asset_1.jpeg',
++        size: 42,
++      };
++
++      mocks.asset.getLibraryContentChecksumMatch.mockResolvedValue({ id: 'library-asset-id', libraryId: 'library-1' });
++
++      await expect(sut.uploadAsset(authStub.user1, createDto, file)).resolves.toEqual({
++        id: 'library-asset-id',
++        status: AssetMediaStatus.DUPLICATE,
++      });
++
++      expect(mocks.asset.create).not.toHaveBeenCalled();
++      expect(mocks.job.queue).toHaveBeenCalledWith({
++        name: JobName.FileDelete,
++        data: { files: [file.originalPath, undefined] },
++      });
++    });
++
+     it('should handle a duplicate', async () => {
+       const file = {
+         uuid: 'random-uuid',
+@@ -815,7 +839,7 @@ describe(AssetMediaService.name, () => {
+         ],
+       });
+ 
+-      expect(mocks.asset.getByChecksums).toHaveBeenCalledWith(authStub.admin.user.id, [file1, file2]);
++      expect(mocks.asset.getByChecksums).toHaveBeenCalledWith(authStub.admin.user.id, [file1, file2], true);
+     });
+ 
+     it('should return non-duplicates as well', async () => {
+@@ -847,7 +871,7 @@ describe(AssetMediaService.name, () => {
+         ],
+       });
+ 
+-      expect(mocks.asset.getByChecksums).toHaveBeenCalledWith(authStub.admin.user.id, [file1, file2]);
++      expect(mocks.asset.getByChecksums).toHaveBeenCalledWith(authStub.admin.user.id, [file1, file2], true);
+     });
+   });
+ 
+diff --git a/server/src/services/asset-media.service.ts b/server/src/services/asset-media.service.ts
+index 5328d98f4..7209b2dda 100644
+--- a/server/src/services/asset-media.service.ts
++++ b/server/src/services/asset-media.service.ts
+@@ -50,7 +50,14 @@ export class AssetMediaService extends BaseService {
+ 
+     await this.requireAccess({ auth, permission: Permission.AssetUpload, ids: [auth.user.id] });
+ 
+-    const assetId = await this.assetRepository.getUploadAssetIdByChecksum(auth.user.id, fromChecksum(checksum));
++    const {
++      library: { checksum: checksumConfig },
++    } = await this.getConfig({ withCache: true });
++    const assetId = await this.assetRepository.getUploadAssetIdByChecksum(
++      auth.user.id,
++      fromChecksum(checksum),
++      checksumConfig.dedupeUploadsAgainstLibraries && !auth.sharedLink,
++    );
+     if (!assetId) {
+       return;
+     }
+@@ -141,6 +148,24 @@ export class AssetMediaService extends BaseService {
+ 
+       this.requireQuota(auth, file.size);
+ 
++      const {
++        library: { checksum: checksumConfig },
++      } = await this.getConfig({ withCache: true });
++      if (!auth.sharedLink && checksumConfig.dedupeUploadsAgainstLibraries) {
++        const duplicate = await this.assetRepository.getLibraryContentChecksumMatch(auth.user.id, file.checksum);
++        if (duplicate) {
++          await this.jobRepository.queue({
++            name: JobName.FileDelete,
++            data: { files: [file.originalPath, sidecarFile?.originalPath] },
++          });
++
++          this.logger.debug(
++            `Duplicate asset upload rejected: content already exists in library ${duplicate.libraryId}`,
++          );
++          return { status: AssetMediaStatus.DUPLICATE, id: duplicate.id };
++        }
++      }
++
+       if (dto.livePhotoVideoId) {
+         await onBeforeLink(
+           { asset: this.assetRepository, event: this.eventRepository },
+@@ -306,8 +331,15 @@ export class AssetMediaService extends BaseService {
+   }
+ 
+   async bulkUploadCheck(auth: AuthDto, dto: AssetBulkUploadCheckDto): Promise<AssetBulkUploadCheckResponseDto> {
++    const {
++      library: { checksum },
++    } = await this.getConfig({ withCache: true });
+     const checksums: Buffer[] = dto.assets.map((asset) => fromChecksum(asset.checksum));
+-    const results = await this.assetRepository.getByChecksums(auth.user.id, checksums);
++    const results = await this.assetRepository.getByChecksums(
++      auth.user.id,
++      checksums,
++      checksum.dedupeUploadsAgainstLibraries && !auth.sharedLink,
++    );
+     const checksumMap: Record<string, { id: string; isTrashed: boolean }> = {};
+ 
+     for (const { id, deletedAt, checksum } of results) {
+diff --git a/server/src/services/library.service.spec.ts b/server/src/services/library.service.spec.ts
+index 2c281c730..990b484ae 100644
+--- a/server/src/services/library.service.spec.ts
++++ b/server/src/services/library.service.spec.ts
+@@ -5,7 +5,15 @@ import type { ILibraryBulkIdsJob, ILibraryFileJob } from 'src/types.js';
+ import { JOBS_LIBRARY_PAGINATION_SIZE } from 'src/constants.js';
+ import { SystemConfig, defaults } from 'src/dtos/config.dto.js';
+ import { mapLibrary } from 'src/dtos/library.dto.js';
+-import { AssetType, CronJob, ImmichWorker, JobName, JobStatus } from 'src/enum.js';
++import {
++  AssetType,
++  ChecksumAlgorithm,
++  ChecksumRehashTarget,
++  CronJob,
++  ImmichWorker,
++  JobName,
++  JobStatus,
++} from 'src/enum.js';
+ import { LibraryService } from 'src/services/library.service.js';
+ import { AssetFactory } from 'test/factories/asset.factory.js';
+ import { authStub } from 'test/fixtures/auth.stub.js';
+@@ -607,6 +615,161 @@ describe(LibraryService.name, () => {
+ 
+       expect(mocks.asset.createAll.mock.calls).toEqual([]);
+     });
++
++    it('should use content checksums when configured', async () => {
++      const library = factory.library();
++      const asset = AssetFactory.create();
++      const checksum = Buffer.from('content-checksum');
++
++      mocks.systemMetadata.get.mockResolvedValue({
++        library: { checksum: { external: ChecksumAlgorithm.sha1File, dedupeUploadsAgainstLibraries: true } },
++      });
++      mocks.crypto.hashFile.mockResolvedValue(checksum);
++      mocks.asset.getLibraryChecksums.mockResolvedValue([]);
++      mocks.asset.createAll.mockResolvedValue([asset.id]);
++      mocks.library.get.mockResolvedValue(library);
++
++      await expect(sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/photo.jpg'] })).resolves.toBe(
++        JobStatus.Success,
++      );
++
++      expect(mocks.crypto.hashFile).toHaveBeenCalledWith('/data/user1/photo.jpg');
++      expect(mocks.asset.createAll).toHaveBeenCalledWith([
++        expect.objectContaining({ checksum, checksumAlgorithm: ChecksumAlgorithm.sha1File }),
++      ]);
++    });
++
++    it('should skip files whose content checksum already exists in the library', async () => {
++      const library = factory.library();
++      const asset = AssetFactory.create();
++      const checksum = Buffer.from('content-checksum');
++
++      mocks.systemMetadata.get.mockResolvedValue({
++        library: { checksum: { external: ChecksumAlgorithm.sha1File, dedupeUploadsAgainstLibraries: true } },
++      });
++      mocks.crypto.hashFile.mockResolvedValue(checksum);
++      mocks.asset.getLibraryChecksums.mockResolvedValue([checksum]);
++      mocks.asset.createAll.mockResolvedValue([asset.id]);
++      mocks.library.get.mockResolvedValue(library);
++
++      await expect(sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/photo.jpg'] })).resolves.toBe(
++        JobStatus.Success,
++      );
++
++      expect(mocks.asset.createAll).toHaveBeenCalledWith([]);
++    });
++  });
++
++  describe('handleRehashChecksums', () => {
++    it('should rehash uploaded assets with content checksums', async () => {
++      const asset = AssetFactory.create({ originalPath: '/data/upload/photo.jpg' });
++      const checksum = Buffer.from('new-checksum');
++
++      async function* stream() {
++        // eslint-disable-next-line unicorn/no-useless-promise-resolve-reject
++        yield await Promise.resolve({
++          id: asset.id,
++          originalPath: asset.originalPath,
++          checksum: Buffer.from('old-checksum'),
++          checksumAlgorithm: ChecksumAlgorithm.sha1Path,
++        });
++      }
++
++      mocks.asset.streamChecksums.mockReturnValue(stream());
++      mocks.crypto.hashFile.mockResolvedValue(checksum);
++
++      await expect(sut.handleRehashChecksums({ target: ChecksumRehashTarget.Upload })).resolves.toBe(JobStatus.Success);
++
++      expect(mocks.asset.streamChecksums).toHaveBeenCalledWith({ uploaded: true });
++      expect(mocks.crypto.hashFile).toHaveBeenCalledWith(asset.originalPath);
++      expect(mocks.asset.updateChecksum).toHaveBeenCalledWith(asset.id, checksum, ChecksumAlgorithm.sha1File);
++    });
++
++    it('should skip assets that already match the configured algorithm', async () => {
++      const asset = AssetFactory.create({ originalPath: '/library/photo.jpg' });
++      const checksum = Buffer.from('same-checksum');
++
++      async function* stream() {
++        // eslint-disable-next-line unicorn/no-useless-promise-resolve-reject
++        yield await Promise.resolve({
++          id: asset.id,
++          originalPath: asset.originalPath,
++          checksum,
++          checksumAlgorithm: ChecksumAlgorithm.sha1Path,
++        });
++      }
++
++      mocks.asset.streamChecksums.mockReturnValue(stream());
++      mocks.crypto.hashSha1.mockReturnValue(checksum);
++
++      await expect(
++        sut.handleRehashChecksums({ target: ChecksumRehashTarget.External, libraryId: asset.libraryId ?? undefined }),
++      ).resolves.toBe(JobStatus.Success);
++
++      expect(mocks.asset.updateChecksum).not.toHaveBeenCalled();
++    });
++
++    it('should count duplicate checksum conflicts without failing', async () => {
++      const asset = AssetFactory.create({ originalPath: '/library/photo.jpg' });
++      const checksum = Buffer.from('conflict-checksum');
++
++      async function* stream() {
++        // eslint-disable-next-line unicorn/no-useless-promise-resolve-reject
++        yield await Promise.resolve({
++          id: asset.id,
++          originalPath: asset.originalPath,
++          checksum: Buffer.from('old-checksum'),
++          checksumAlgorithm: ChecksumAlgorithm.sha1Path,
++        });
++      }
++
++      mocks.asset.streamChecksums.mockReturnValue(stream());
++      mocks.crypto.hashFile.mockResolvedValue(checksum);
++      mocks.asset.updateChecksum.mockRejectedValue({
++        constraint_name: 'UQ_assets_owner_library_checksum',
++      });
++
++      await expect(sut.handleRehashChecksums({ target: ChecksumRehashTarget.Upload })).resolves.toBe(JobStatus.Success);
++
++      expect(mocks.asset.updateChecksum).toHaveBeenCalled();
++    });
++  });
++
++  describe('queueRecomputeChecksums', () => {
++    it('should queue an upload rehash job', async () => {
++      await sut.queueRecomputeChecksums({ target: ChecksumRehashTarget.Upload });
++
++      expect(mocks.job.queue).toHaveBeenCalledWith({
++        name: JobName.LibraryRehash,
++        data: { target: ChecksumRehashTarget.Upload },
++      });
++    });
++
++    it('should queue a rehash job for a single library', async () => {
++      const library = factory.library();
++      mocks.library.get.mockResolvedValue(library);
++
++      await sut.queueRecomputeChecksums({ target: ChecksumRehashTarget.External, libraryId: library.id });
++
++      expect(mocks.job.queue).toHaveBeenCalledWith({
++        name: JobName.LibraryRehash,
++        data: { target: ChecksumRehashTarget.External, libraryId: library.id },
++      });
++    });
++
++    it('should queue rehash jobs for all libraries', async () => {
++      const libraries = [factory.library(), factory.library()];
++      mocks.library.getAll.mockResolvedValue(libraries);
++
++      await sut.queueRecomputeChecksums({ target: ChecksumRehashTarget.External });
++
++      expect(mocks.job.queueAll).toHaveBeenCalledWith(
++        libraries.map((library) => ({
++          name: JobName.LibraryRehash,
++          data: { target: ChecksumRehashTarget.External, libraryId: library.id },
++        })),
++      );
++    });
+   });
+ 
+   describe('delete', () => {
+diff --git a/server/src/services/library.service.ts b/server/src/services/library.service.ts
+index 7fac6db3f..15f1a3111 100644
+--- a/server/src/services/library.service.ts
++++ b/server/src/services/library.service.ts
+@@ -13,6 +13,7 @@ import {
+   CreateLibraryDto,
+   LibraryResponseDto,
+   LibraryStatsResponseDto,
++  RecomputeChecksumsDto,
+   UpdateLibraryDto,
+   ValidateLibraryDto,
+   ValidateLibraryImportPathResponseDto,
+@@ -23,6 +24,7 @@ import {
+   AssetStatus,
+   AssetType,
+   ChecksumAlgorithm,
++  ChecksumRehashTarget,
+   CronJob,
+   DatabaseLock,
+   ImmichWorker,
+@@ -33,6 +35,7 @@ import {
+ import { AssetSyncResult } from 'src/repositories/library.repository.js';
+ import { AssetTable } from 'src/schema/tables/asset.table.js';
+ import { BaseService } from 'src/services/base.service.js';
++import { isAssetChecksumConstraint } from 'src/utils/database.js';
+ import { mimeTypes } from 'src/utils/mime-types.js';
+ import { batched, findOrFail, handlePromiseError } from 'src/utils/misc.js';
+ 
+@@ -263,11 +266,14 @@ export class LibraryService extends BaseService {
+       return JobStatus.Failed;
+     }
+ 
++    const {
++      library: { checksum },
++    } = await this.getConfig({ withCache: true });
+     const assetImports: Insertable<AssetTable>[] = [];
+     await Promise.all(
+       job.paths.map(async (path) => {
+         try {
+-          const asset = await this.processEntity(path, library.ownerId, job.libraryId);
++          const asset = await this.processEntity(path, library.ownerId, job.libraryId, checksum.external);
+           assetImports.push(asset);
+         } catch (error) {
+           this.logger.error(`Error processing ${path} for library ${job.libraryId}: ${error}`);
+@@ -275,7 +281,18 @@ export class LibraryService extends BaseService {
+       }),
+     );
+ 
+-    const assetIds = await this.assetRepository.createAll(assetImports);
++    const filtered = await this.filterDuplicateChecksums(job.libraryId, library.ownerId, assetImports);
++    let assetIds: string[];
++    try {
++      assetIds = await this.assetRepository.createAll(filtered);
++    } catch (error) {
++      if (!isAssetChecksumConstraint(error)) {
++        throw error;
++      }
++
++      // Another import inserted the same content concurrently. Retry one by one and skip duplicates.
++      assetIds = await this.createAssetsSkippingDuplicates(filtered);
++    }
+ 
+     const progressMessage =
+       job.progressCounter && job.totalAssets
+@@ -399,15 +416,23 @@ export class LibraryService extends BaseService {
+     return JobStatus.Success;
+   }
+ 
+-  private async processEntity(filePath: string, ownerId: string, libraryId: string) {
++  private async processEntity(
++    filePath: string,
++    ownerId: string,
++    libraryId: string,
++    checksumAlgorithm: ChecksumAlgorithm,
++  ) {
+     const assetPath = path.normalize(filePath);
+     const stat = await this.storageRepository.stat(assetPath);
+ 
+     return {
+       ownerId,
+       libraryId,
+-      checksum: this.cryptoRepository.hashSha1(`path:${assetPath}`),
+-      checksumAlgorithm: ChecksumAlgorithm.sha1Path,
++      checksum:
++        checksumAlgorithm === ChecksumAlgorithm.sha1File
++          ? await this.cryptoRepository.hashFile(assetPath)
++          : this.cryptoRepository.hashSha1(`path:${assetPath}`),
++      checksumAlgorithm,
+       originalPath: assetPath,
+ 
+       fileCreatedAt: stat.mtime,
+@@ -420,6 +445,154 @@ export class LibraryService extends BaseService {
+     };
+   }
+ 
++  private async filterDuplicateChecksums(libraryId: string, ownerId: string, assets: Insertable<AssetTable>[]) {
++    if (assets.length === 0) {
++      return assets;
++    }
++
++    // Path based checksums are unique per path, so there is nothing to de-duplicate
++    if (assets[0].checksumAlgorithm === ChecksumAlgorithm.sha1Path) {
++      return assets;
++    }
++
++    const byChecksum = new Map<string, Insertable<AssetTable>>();
++    for (const asset of assets) {
++      byChecksum.set(asset.checksum.toString('hex'), asset);
++    }
++
++    const checksums = byChecksum
++      .values()
++      .map((asset) => asset.checksum)
++      .toArray();
++    const existing = await this.assetRepository.getLibraryChecksums(ownerId, libraryId, checksums);
++    for (const checksum of existing) {
++      byChecksum.delete(checksum.toString('hex'));
++    }
++
++    const duplicateCount = assets.length - byChecksum.size;
++    if (duplicateCount > 0) {
++      this.logger.log(
++        `Skipped ${duplicateCount} file(s) with duplicate checksums while importing library ${libraryId}`,
++      );
++    }
++
++    return byChecksum.values().toArray();
++  }
++
++  private async createAssetsSkippingDuplicates(assets: Insertable<AssetTable>[]) {
++    const ids: string[] = [];
++    for (const asset of assets) {
++      try {
++        ids.push(...(await this.assetRepository.createAll([asset])));
++      } catch (error) {
++        if (!isAssetChecksumConstraint(error)) {
++          throw error;
++        }
++
++        this.logger.warn(`Skipped duplicate asset ${asset.originalPath} while importing library ${asset.libraryId}`);
++      }
++    }
++
++    return ids;
++  }
++
++  async queueRecomputeChecksums(dto: RecomputeChecksumsDto): Promise<void> {
++    const {
++      library: { checksum },
++    } = await this.getConfig({ withCache: true });
++
++    if (dto.target === ChecksumRehashTarget.Upload) {
++      this.logger.log('Queueing checksum recomputation for uploaded assets');
++      await this.jobRepository.queue({
++        name: JobName.LibraryRehash,
++        data: { target: ChecksumRehashTarget.Upload },
++      });
++      return;
++    }
++
++    if (dto.libraryId) {
++      const library = await this.findOrFail(dto.libraryId);
++      this.logger.log(`Queueing checksum recomputation for library ${library.id} using ${checksum.external}`);
++      await this.jobRepository.queue({
++        name: JobName.LibraryRehash,
++        data: { target: ChecksumRehashTarget.External, libraryId: library.id },
++      });
++      return;
++    }
++
++    const libraries = await this.libraryRepository.getAll(false);
++    this.logger.log(
++      `Queueing checksum recomputation for ${libraries.length} external library(ies) using ${checksum.external}`,
++    );
++    await this.jobRepository.queueAll(
++      libraries.map((library) => ({
++        name: JobName.LibraryRehash,
++        data: { target: ChecksumRehashTarget.External, libraryId: library.id },
++      })),
++    );
++  }
++
++  @OnJob({ name: JobName.LibraryRehash, queue: QueueName.Library })
++  async handleRehashChecksums(job: JobOf<JobName.LibraryRehash>): Promise<JobStatus> {
++    const {
++      library: { checksum },
++    } = await this.getConfig({ withCache: true });
++    const isExternal = job.target === ChecksumRehashTarget.External;
++    const algorithm = isExternal ? checksum.external : ChecksumAlgorithm.sha1File;
++    const source = isExternal ? `library ${job.libraryId ?? '(all)'}` : 'uploaded assets';
++    const assets = isExternal
++      ? job.libraryId
++        ? this.assetRepository.streamChecksums({ libraryId: job.libraryId })
++        : this.assetRepository.streamChecksums({ external: true })
++      : this.assetRepository.streamChecksums({ uploaded: true });
++
++    this.logger.log(`Starting checksum recomputation for ${source} using ${algorithm}`);
++
++    let checked = 0;
++    let updated = 0;
++    let skipped = 0;
++    let failed = 0;
++    let conflicts = 0;
++
++    for await (const batch of batched(assets, JOBS_LIBRARY_PAGINATION_SIZE)) {
++      for (const asset of batch) {
++        checked++;
++        try {
++          const checksum =
++            algorithm === ChecksumAlgorithm.sha1File
++              ? await this.cryptoRepository.hashFile(asset.originalPath)
++              : this.cryptoRepository.hashSha1(`path:${asset.originalPath}`);
++
++          if (asset.checksumAlgorithm === algorithm && asset.checksum.equals(checksum)) {
++            skipped++;
++            continue;
++          }
++
++          await this.assetRepository.updateChecksum(asset.id, checksum, algorithm);
++          updated++;
++        } catch (error) {
++          if (isAssetChecksumConstraint(error)) {
++            conflicts++;
++            continue;
++          }
++
++          failed++;
++          this.logger.warn(`Unable to recompute checksum for asset ${asset.id} (${asset.originalPath}): ${error}`);
++        }
++      }
++
++      this.logger.log(
++        `Checksum recomputation for ${source}: ${checked} checked, ${updated} updated, ${skipped} unchanged, ${conflicts} duplicate conflicts, ${failed} failed`,
++      );
++    }
++
++    this.logger.log(
++      `Finished checksum recomputation for ${source}: ${checked} checked, ${updated} updated, ${skipped} unchanged, ${conflicts} duplicate conflicts, ${failed} failed`,
++    );
++
++    return JobStatus.Success;
++  }
++
+   async queuePostSyncJobs(assetIds: string[]) {
+     this.logger.debug(`Queuing sidecar discovery for ${assetIds.length} asset(s)`);
+ 
+diff --git a/server/src/services/system-config.service.spec.ts b/server/src/services/system-config.service.spec.ts
+index f4b72831b..46047c06d 100644
+--- a/server/src/services/system-config.service.spec.ts
++++ b/server/src/services/system-config.service.spec.ts
+@@ -4,6 +4,7 @@ import { SystemConfig, defaults } from 'src/dtos/config.dto.js';
+ import {
+   AudioCodec,
+   CQMode,
++  ChecksumAlgorithm,
+   Colorspace,
+   HlsVideoResolution,
+   ImageFormat,
+@@ -231,6 +232,10 @@ const updatedConfig = Object.freeze<SystemConfig>({
+     watch: {
+       enabled: false,
+     },
++    checksum: {
++      external: ChecksumAlgorithm.sha1Path,
++      dedupeUploadsAgainstLibraries: true,
++    },
+   },
+   user: {
+     deleteDelay: 15,
+diff --git a/server/src/types.ts b/server/src/types.ts
+index e338a7fea..a7b26970a 100644
+--- a/server/src/types.ts
++++ b/server/src/types.ts
+@@ -12,6 +12,7 @@ import {
+   AssetOrder,
+   AssetType,
+   Av1Profile,
++  ChecksumRehashTarget,
+   ColorMatrix,
+   ColorPrimaries,
+   ColorTransfer,
+@@ -258,6 +259,11 @@ export interface ILibraryBulkIdsJob {
+   totalAssets: number;
+ }
+ 
++export interface ILibraryRehashJob {
++  target: ChecksumRehashTarget;
++  libraryId?: string;
++}
++
+ export interface IDeleteFilesJob extends IBaseJob {
+   files: Array<string | null | undefined>;
+ }
+@@ -431,6 +437,7 @@ export type JobItem =
+   | { name: JobName.LibraryDelete; data: IEntityJob }
+   | { name: JobName.LibraryScanQueueAll; data?: IBaseJob }
+   | { name: JobName.LibraryDeleteCheck; data: IBaseJob }
++  | { name: JobName.LibraryRehash; data: ILibraryRehashJob }
+ 
+   // Notification
+   | { name: JobName.SendMail; data: IEmailJob }
+diff --git a/server/src/utils/database.ts b/server/src/utils/database.ts
+index 51aac25b1..8c0183927 100644
+--- a/server/src/utils/database.ts
++++ b/server/src/utils/database.ts
+@@ -100,10 +100,13 @@ export const removeUndefinedKeys = <T extends object>(update: T, template: unkno
+ };
+ 
+ export const ASSET_CHECKSUM_CONSTRAINT = 'UQ_assets_owner_checksum';
++export const ASSET_LIBRARY_CHECKSUM_CONSTRAINT = 'UQ_assets_owner_library_checksum';
+ export const VIDEO_STREAM_SESSION_PK_CONSTRAINT = 'video_stream_session_pkey';
+ 
+-export const isAssetChecksumConstraint = (error: unknown) =>
+-  (error as PostgresError)?.constraint_name === ASSET_CHECKSUM_CONSTRAINT;
++export const isAssetChecksumConstraint = (error: unknown) => {
++  const constraint = (error as PostgresError)?.constraint_name;
++  return constraint === ASSET_CHECKSUM_CONSTRAINT || constraint === ASSET_LIBRARY_CHECKSUM_CONSTRAINT;
++};
+ 
+ export const isVideoStreamSessionPkConstraint = (error: unknown) =>
+   (error as PostgresError)?.constraint_name === VIDEO_STREAM_SESSION_PK_CONSTRAINT;
+diff --git a/server/test/repositories/asset.repository.mock.ts b/server/test/repositories/asset.repository.mock.ts
+index 8b4fa1c9f..06319933d 100644
+--- a/server/test/repositories/asset.repository.mock.ts
++++ b/server/test/repositories/asset.repository.mock.ts
+@@ -18,6 +18,10 @@ export const newAssetRepositoryMock = (): Mocked<RepositoryInterface<AssetReposi
+     getById: vitest.fn(),
+     getByChecksum: vitest.fn(),
+     getByChecksums: vitest.fn(),
++    getLibraryContentChecksumMatch: vitest.fn(),
++    getLibraryChecksums: vitest.fn().mockResolvedValue([]),
++    streamChecksums: vitest.fn(),
++    updateChecksum: vitest.fn(),
+     getUploadAssetIdByChecksum: vitest.fn(),
+     getLivePhotoCount: vitest.fn(),
+     getLibraryAssetCount: vitest.fn(),
+-- 
+2.55.0
+

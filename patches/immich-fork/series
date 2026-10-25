@@ -1,0 +1,5 @@
+0001-fix-mobile-hash-assets-without-ACCESS_MEDIA_LOCATION.patch
+0002-feat-server-configurable-library-checksums-and-rehas.patch
+0003-chore-open-api-regenerate-spec-and-TypeScript-SDK.patch
+0004-feat-web-expose-checksum-settings-and-recompute-acti.patch
+0005-ci-keep-only-Docker-and-Release-workflows-for-the-fo.patch

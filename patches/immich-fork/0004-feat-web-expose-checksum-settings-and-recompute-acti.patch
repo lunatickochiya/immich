@@ -1,0 +1,271 @@
+From b1425ae2dcf0a86d89f8ea133a3d155063498239 Mon Sep 17 00:00:00 2001
+From: lunatickochiya <125438787@qq.com>
+Date: Sun, 25 Oct 2026 14:08:52 +0800
+Subject: [PATCH 4/5] feat(web): expose checksum settings and recompute actions
+
+Adds an admin Checksums section for external library checksums, the fixed
+content SHA-1 upload checksum, upload de-duplication and background
+recompute buttons. Includes en/zh_Hans strings and updates the e2e config
+fixture.
+---
+ e2e/src/ui/mock-network/config-fixtures.ts    |   6 +-
+ i18n/en.json                                  |  18 +++
+ i18n/zh_Hans.json                             |  18 +++
+ .../system-settings/LibrarySettings.svelte    | 105 +++++++++++++++++-
+ 4 files changed, 145 insertions(+), 2 deletions(-)
+
+diff --git a/e2e/src/ui/mock-network/config-fixtures.ts b/e2e/src/ui/mock-network/config-fixtures.ts
+index a9b2a42b5..efa87683b 100644
+--- a/e2e/src/ui/mock-network/config-fixtures.ts
++++ b/e2e/src/ui/mock-network/config-fixtures.ts
+@@ -156,7 +156,11 @@ export const adminConfig = {
+   },
+   trash: { enabled: true, days: 30 },
+   theme: { customCss: '' },
+-  library: { scan: { enabled: true, cronExpression: '0 0 * * *' }, watch: { enabled: false } },
++  library: {
++    scan: { enabled: true, cronExpression: '0 0 * * *' },
++    watch: { enabled: false },
++    checksum: { external: 'sha1-path', dedupeUploadsAgainstLibraries: true },
++  },
+   server: { externalDomain: '', loginPageMessage: '', publicUsers: true },
+   notifications: {
+     smtp: {
+diff --git a/i18n/en.json b/i18n/en.json
+index c7b061ff4..6d626f9a3 100644
+--- a/i18n/en.json
++++ b/i18n/en.json
+@@ -61,6 +61,8 @@
+     "backup_onboarding_title": "Backups",
+     "backup_settings": "Database Dump Settings",
+     "backup_settings_description": "Manage database dump settings.",
++    "checksum_content_sha1": "Content (SHA-1)",
++    "checksum_path_sha1": "Path (SHA-1)",
+     "cleared_jobs": "Cleared jobs for: {job}",
+     "config_set_by_file": "Config is currently set by a config file",
+     "confirm_delete_library": "Are you sure you want to delete {library} library?",
+@@ -133,9 +135,15 @@
+     "jobs_delayed": "{jobCount, plural, other {# delayed}}",
+     "jobs_failed": "{jobCount, plural, other {# failed}}",
+     "jobs_over_time": "Jobs over time",
++    "library_checksum_settings": "Checksums",
++    "library_checksum_settings_description": "Configure how asset checksums are calculated and compared",
+     "library_created": "Created library: {library}",
++    "library_dedupe_uploads": "De-duplicate uploads against external libraries",
++    "library_dedupe_uploads_description": "Reject an upload when an external library asset already has the same content checksum",
+     "library_deleted": "Library deleted",
+     "library_details": "Library details",
++    "library_external_checksum": "External library checksum",
++    "library_external_checksum_description": "Path hashes are fast and detect renamed/moved files. Content hashes are slower but allow de-duplication against uploads; identical files inside one library are then imported only once.",
+     "library_folder_description": "Specify a folder to import. This folder, including subfolders, will be scanned for images and videos.",
+     "library_remove_exclusion_pattern_prompt": "Are you sure you want to remove this exclusion pattern?",
+     "library_remove_folder_prompt": "Are you sure you want to remove this import folder?",
+@@ -146,6 +154,8 @@
+     "library_settings_description": "Manage external library settings",
+     "library_tasks_description": "Scan external libraries for new and/or changed assets",
+     "library_updated": "Updated library",
++    "library_upload_checksum": "Uploaded asset checksum",
++    "library_upload_checksum_description": "Uploads always use the content SHA-1 of the uploaded file. This cannot be changed.",
+     "library_watching_enable_description": "Watch external libraries for file changes",
+     "library_watching_settings": "Library watching [EXPERIMENTAL]",
+     "library_watching_settings_description": "Automatically watch for changed files",
+@@ -339,6 +349,14 @@
+     "queues": "Job Queues",
+     "queues_page_description": "Admin job queues page",
+     "quota_size_gib": "Quota Size (GiB)",
++    "recompute_checksums": "Recompute checksums",
++    "recompute_checksums_description": "Recomputing runs in the background and updates existing assets to the currently configured algorithm. Duplicate content is skipped so the database stays consistent.",
++    "recompute_checksums_queued": "Checksum recomputation queued",
++    "recompute_checksums_unsaved": "Save the checksum settings before recomputing.",
++    "recompute_external_checksums": "Recompute external library checksums",
++    "recompute_external_checksums_prompt": "Recompute checksums for all external library assets using the configured algorithm? This can take a long time for large libraries.",
++    "recompute_upload_checksums": "Recompute uploaded asset checksums",
++    "recompute_upload_checksums_prompt": "Recompute content checksums for all uploaded assets? This can take a long time for large libraries.",
+     "refreshing_all_libraries": "Refreshing all libraries",
+     "registration": "Admin Registration",
+     "registration_description": "Since you are the first user on the system, you will be assigned as the Admin and are responsible for administrative tasks, and additional users will be created by you.",
+diff --git a/i18n/zh_Hans.json b/i18n/zh_Hans.json
+index eba348dda..a864e222b 100644
+--- a/i18n/zh_Hans.json
++++ b/i18n/zh_Hans.json
+@@ -61,6 +61,8 @@
+     "backup_onboarding_title": "备份",
+     "backup_settings": "数据库备份设置",
+     "backup_settings_description": "管理数据库备份设置。",
++    "checksum_content_sha1": "内容（SHA-1）",
++    "checksum_path_sha1": "路径（SHA-1）",
+     "cleared_jobs": "已停止任务：{job}",
+     "config_set_by_file": "当前配置由配置文件设定",
+     "confirm_delete_library": "确定要删除资源库“{library}”吗？",
+@@ -133,9 +135,15 @@
+     "jobs_delayed": "{jobCount, plural, other {#个延迟}}",
+     "jobs_failed": "{jobCount, plural, other {#个失败}}",
+     "jobs_over_time": "任务动态",
++    "library_checksum_settings": "校验和",
++    "library_checksum_settings_description": "配置资产校验和的计算与比对方式",
+     "library_created": "已创建资源库：{library}",
++    "library_dedupe_uploads": "上传时比对外部库去重",
++    "library_dedupe_uploads_description": "当外部库中已存在相同内容校验和的资产时，拒绝重复上传",
+     "library_deleted": "资源库已删除",
+     "library_details": "资源库详情",
++    "library_external_checksum": "外部库校验和",
++    "library_external_checksum_description": "路径哈希速度快，可检测文件改名/移动；内容哈希较慢，但可与上传资产去重；同一库中内容完全相同的文件只会导入一次。",
+     "library_folder_description": "指定要导入的文件夹。系统将扫描此文件夹（包括子文件夹）中的照片与视频。",
+     "library_remove_exclusion_pattern_prompt": "确定要移除此排除规则吗？",
+     "library_remove_folder_prompt": "确定要移除此导入文件夹吗？",
+@@ -146,6 +154,8 @@
+     "library_settings_description": "管理外部资源库设置",
+     "library_tasks_description": "扫描并查找外部资源库中新增或变更的项目",
+     "library_updated": "资源库已更新",
++    "library_upload_checksum": "上传资产校验和",
++    "library_upload_checksum_description": "上传资产始终使用文件内容的 SHA-1，不可更改。",
+     "library_watching_enable_description": "监控外部资源库的文件变更",
+     "library_watching_settings": "资源库监控 [实验性功能]",
+     "library_watching_settings_description": "自动监控文件变更",
+@@ -332,6 +342,14 @@
+     "queues": "任务队列",
+     "queues_page_description": "管理任务队列页面",
+     "quota_size_gib": "配额大小（GiB）",
++    "recompute_checksums": "重新计算校验和",
++    "recompute_checksums_description": "重算在后台运行，会把已有资产更新为当前配置的算法。内容重复的资产会被跳过，以保证数据库一致。",
++    "recompute_checksums_queued": "已加入校验和重算队列",
++    "recompute_checksums_unsaved": "请先保存校验和设置，再执行重算。",
++    "recompute_external_checksums": "重算外部库校验和",
++    "recompute_external_checksums_prompt": "使用当前配置的算法重算所有外部库资产的校验和？大库可能需要很长时间。",
++    "recompute_upload_checksums": "重算上传资产校验和",
++    "recompute_upload_checksums_prompt": "重新计算所有上传资产的内容校验和？大库可能需要很长时间。",
+     "refreshing_all_libraries": "刷新所有库",
+     "registration": "管理员注册",
+     "registration_description": "由于您是系统的第一位用户，系统将自动为您分配管理员权限。您需要负责相关的管理任务，后续的其他用户也将由您来创建。",
+diff --git a/web/src/routes/admin/system-settings/LibrarySettings.svelte b/web/src/routes/admin/system-settings/LibrarySettings.svelte
+index 31d28dc9b..a621eab33 100644
+--- a/web/src/routes/admin/system-settings/LibrarySettings.svelte
++++ b/web/src/routes/admin/system-settings/LibrarySettings.svelte
+@@ -10,7 +10,10 @@
+   import { SettingInputFieldType } from '$lib/constants';
+   import FormatMessage from '$lib/elements/FormatMessage.svelte';
+   import { featureFlagsManager } from '$lib/managers/feature-flags-manager.svelte';
+-  import { Link } from '@immich/ui';
++  import { handleError } from '$lib/utils/handle-error';
++  import { ChecksumAlgorithm, ChecksumRehashTarget, recomputeChecksums } from '@immich/sdk';
++  import { Button, Link, modalManager, toastManager } from '@immich/ui';
++  import { mdiDatabaseRefreshOutline } from '@mdi/js';
+   import { t } from 'svelte-i18n';
+   import { fade } from 'svelte/transition';
+ 
+@@ -26,12 +29,112 @@
+     { text: $t('interval.day_at_onepm'), value: '0 13 * * *' },
+     { text: $t('interval.hours', { values: { hours: 6 } }), value: '0 */6 * * *' },
+   ]);
++
++  const checksumOptions = $derived([
++    { value: ChecksumAlgorithm.Sha1, text: $t('admin.checksum_content_sha1') },
++    { value: ChecksumAlgorithm.Sha1Path, text: $t('admin.checksum_path_sha1') },
++  ]);
++
++  const checksumSettingsChanged = $derived(
++    configToEdit.library.checksum.external !== config.library.checksum.external ||
++      configToEdit.library.checksum.dedupeUploadsAgainstLibraries !==
++        config.library.checksum.dedupeUploadsAgainstLibraries,
++  );
++
++  const handleRecompute = async (target: ChecksumRehashTarget) => {
++    const confirmed = await modalManager.showDialog({
++      icon: mdiDatabaseRefreshOutline,
++      title: $t('admin.recompute_checksums'),
++      prompt:
++        target === ChecksumRehashTarget.External
++          ? $t('admin.recompute_external_checksums_prompt')
++          : $t('admin.recompute_upload_checksums_prompt'),
++      confirmText: $t('admin.recompute_checksums'),
++      confirmColor: 'primary',
++    });
++
++    if (!confirmed) {
++      return;
++    }
++
++    try {
++      await recomputeChecksums({ recomputeChecksumsDto: { target } });
++      toastManager.info($t('admin.recompute_checksums_queued'));
++    } catch (error) {
++      handleError(error, $t('errors.something_went_wrong'));
++    }
++  };
+ </script>
+ 
+ <div>
+   <div in:fade={{ duration: 500 }}>
+     <form autocomplete="off" onsubmit={(event) => event.preventDefault()}>
+       <div class="ms-4 mt-4 flex flex-col gap-4">
++        <SettingAccordion
++          key="library-checksums"
++          title={$t('admin.library_checksum_settings')}
++          subtitle={$t('admin.library_checksum_settings_description')}
++        >
++          <div class="ms-4 mt-4 flex flex-col gap-4">
++            <SettingSelect
++              name="external-checksum"
++              label={$t('admin.library_external_checksum')}
++              desc={$t('admin.library_external_checksum_description')}
++              options={checksumOptions}
++              bind:value={configToEdit.library.checksum.external}
++              {disabled}
++              isEdited={configToEdit.library.checksum.external !== config.library.checksum.external}
++            />
++
++            <SettingSelect
++              name="upload-checksum"
++              label={$t('admin.library_upload_checksum')}
++              desc={$t('admin.library_upload_checksum_description')}
++              options={[{ value: ChecksumAlgorithm.Sha1, text: $t('admin.checksum_content_sha1') }]}
++              value={ChecksumAlgorithm.Sha1}
++              disabled={true}
++            />
++
++            <SettingSwitch
++              title={$t('admin.library_dedupe_uploads')}
++              subtitle={$t('admin.library_dedupe_uploads_description')}
++              bind:checked={configToEdit.library.checksum.dedupeUploadsAgainstLibraries}
++              {disabled}
++              isEdited={configToEdit.library.checksum.dedupeUploadsAgainstLibraries !==
++                config.library.checksum.dedupeUploadsAgainstLibraries}
++            />
++
++            <div class="flex flex-wrap gap-2">
++              <Button
++                size="small"
++                variant="ghost"
++                shape="round"
++                disabled={disabled || checksumSettingsChanged}
++                onclick={() => handleRecompute(ChecksumRehashTarget.External)}
++              >
++                {$t('admin.recompute_external_checksums')}
++              </Button>
++              <Button
++                size="small"
++                variant="ghost"
++                shape="round"
++                disabled={disabled || checksumSettingsChanged}
++                onclick={() => handleRecompute(ChecksumRehashTarget.Upload)}
++              >
++                {$t('admin.recompute_upload_checksums')}
++              </Button>
++            </div>
++
++            {#if checksumSettingsChanged}
++              <p class="text-sm text-orange-600 dark:text-orange-400">
++                {$t('admin.recompute_checksums_unsaved')}
++              </p>
++            {/if}
++
++            <p class="text-sm dark:text-immich-dark-fg">{$t('admin.recompute_checksums_description')}</p>
++          </div>
++        </SettingAccordion>
++
+         <SettingAccordion
+           key="library-watching"
+           title={$t('admin.library_watching_settings')}
+-- 
+2.55.0
+
