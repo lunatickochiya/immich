@@ -7,6 +7,9 @@ checkout or turned into an upstream PR.
 - **Base commit:** `d474ec966` (`v3.3.0-rc.0` era, upstream `main` on 2026-10-24)
 - **Series tip:** `patch-series` branch, tree-identical to `5de6bdea0` on `main`
 - **Patch format:** `git format-patch` (works with `git am --3way`)
+- **Verified on:** upstream `256eb55db` (2026-10-25, includes the machine-learning
+  and pillow dependency updates) — 0001–0004 apply with `git am --3way` without
+  conflicts. The fork `main` merge `a78c1dcf1` already contains these patches.
 
 ## Patch list
 
