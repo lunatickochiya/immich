@@ -27,6 +27,14 @@ Convenience bundles:
   prepare a PR against upstream.
 - `immich-fork-all.patch` — everything, including the fork-only CI rewrite.
 
+Ready-made branches:
+
+- `patch-series` — the five logical commits based on `d474ec966` (source of the
+  numbered patches).
+- `upstream-pr` — upstream `256eb55db` + 0001–0004, no CI changes. Open a PR
+  with:
+  <https://github.com/immich-app/immich/compare/main...lunatickochiya:upstream-pr>
+
 ## Apply
 
 ### On a newer Immich checkout (recommended: `git am`)
