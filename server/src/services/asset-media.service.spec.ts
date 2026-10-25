@@ -193,7 +193,7 @@ describe(AssetMediaService.name, () => {
 
     it('should handle a non-existent asset', async () => {
       await expect(sut.getUploadAssetIdByChecksum(authStub.admin, file1.toString('hex'))).resolves.toBeUndefined();
-      expect(mocks.asset.getUploadAssetIdByChecksum).toHaveBeenCalledWith(authStub.admin.user.id, file1);
+      expect(mocks.asset.getUploadAssetIdByChecksum).toHaveBeenCalledWith(authStub.admin.user.id, file1, true);
     });
 
     it('should find an existing asset', async () => {
@@ -202,7 +202,7 @@ describe(AssetMediaService.name, () => {
         id: 'asset-id',
         status: AssetMediaStatus.DUPLICATE,
       });
-      expect(mocks.asset.getUploadAssetIdByChecksum).toHaveBeenCalledWith(authStub.admin.user.id, file1);
+      expect(mocks.asset.getUploadAssetIdByChecksum).toHaveBeenCalledWith(authStub.admin.user.id, file1, true);
     });
 
     it('should find an existing asset by base64', async () => {
@@ -211,7 +211,7 @@ describe(AssetMediaService.name, () => {
         id: 'asset-id',
         status: AssetMediaStatus.DUPLICATE,
       });
-      expect(mocks.asset.getUploadAssetIdByChecksum).toHaveBeenCalledWith(authStub.admin.user.id, file1);
+      expect(mocks.asset.getUploadAssetIdByChecksum).toHaveBeenCalledWith(authStub.admin.user.id, file1, true);
     });
   });
 
@@ -363,6 +363,30 @@ describe(AssetMediaService.name, () => {
         expect.any(Date),
         new Date(createDto.fileModifiedAt),
       );
+    });
+
+    it('should deduplicate against an external library asset', async () => {
+      const file = {
+        uuid: 'random-uuid',
+        originalPath: 'fake_path/asset_1.jpeg',
+        mimeType: 'image/jpeg',
+        checksum: Buffer.from('file hash', 'utf8'),
+        originalName: 'asset_1.jpeg',
+        size: 42,
+      };
+
+      mocks.asset.getLibraryContentChecksumMatch.mockResolvedValue({ id: 'library-asset-id', libraryId: 'library-1' });
+
+      await expect(sut.uploadAsset(authStub.user1, createDto, file)).resolves.toEqual({
+        id: 'library-asset-id',
+        status: AssetMediaStatus.DUPLICATE,
+      });
+
+      expect(mocks.asset.create).not.toHaveBeenCalled();
+      expect(mocks.job.queue).toHaveBeenCalledWith({
+        name: JobName.FileDelete,
+        data: { files: [file.originalPath, undefined] },
+      });
     });
 
     it('should handle a duplicate', async () => {
@@ -815,7 +839,7 @@ describe(AssetMediaService.name, () => {
         ],
       });
 
-      expect(mocks.asset.getByChecksums).toHaveBeenCalledWith(authStub.admin.user.id, [file1, file2]);
+      expect(mocks.asset.getByChecksums).toHaveBeenCalledWith(authStub.admin.user.id, [file1, file2], true);
     });
 
     it('should return non-duplicates as well', async () => {
@@ -847,7 +871,7 @@ describe(AssetMediaService.name, () => {
         ],
       });
 
-      expect(mocks.asset.getByChecksums).toHaveBeenCalledWith(authStub.admin.user.id, [file1, file2]);
+      expect(mocks.asset.getByChecksums).toHaveBeenCalledWith(authStub.admin.user.id, [file1, file2], true);
     });
   });
 

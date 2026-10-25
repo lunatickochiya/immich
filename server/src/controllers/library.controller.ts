@@ -5,6 +5,7 @@ import {
   CreateLibraryDto,
   LibraryResponseDto,
   LibraryStatsResponseDto,
+  RecomputeChecksumsDto,
   UpdateLibraryDto,
   ValidateLibraryDto,
   ValidateLibraryResponseDto,
@@ -80,6 +81,19 @@ export class LibraryController {
   })
   deleteLibrary(@Param() { id }: UUIDParamDto): Promise<void> {
     return this.service.delete(id);
+  }
+
+  @Post('recompute-checksums')
+  @Authenticated({ permission: Permission.LibraryUpdate, admin: true })
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @Endpoint({
+    summary: 'Recompute asset checksums',
+    description:
+      'Queue a background job that recomputes asset checksums. External libraries use the configured checksum algorithm, uploads always use the content SHA-1.',
+    history: new HistoryBuilder().added('v3.3.0').beta('v3.3.0'),
+  })
+  recomputeChecksums(@Body() dto: RecomputeChecksumsDto): Promise<void> {
+    return this.service.queueRecomputeChecksums(dto);
   }
 
   @Post(':id/validate')

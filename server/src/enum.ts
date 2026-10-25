@@ -58,6 +58,20 @@ export enum ChecksumAlgorithm {
   sha1Path = 'sha1-path',
 }
 
+export const ChecksumAlgorithmSchema = z.enum(ChecksumAlgorithm).describe('Checksum algorithm').meta({
+  id: 'ChecksumAlgorithm',
+});
+
+export enum ChecksumRehashTarget {
+  External = 'external',
+  Upload = 'upload',
+}
+
+export const ChecksumRehashTargetSchema = z
+  .enum(ChecksumRehashTarget)
+  .describe('Which assets to recompute checksums for')
+  .meta({ id: 'ChecksumRehashTarget' });
+
 export enum AssetFileType {
   /**
    * An full/large-size image extracted/converted from RAW photos
@@ -920,6 +934,7 @@ export enum JobName {
   LibrarySyncFilesQueueAll = 'LibrarySyncFilesQueueAll',
   LibrarySyncFiles = 'LibrarySyncFiles',
   LibraryScanQueueAll = 'LibraryScanQueueAll',
+  LibraryRehash = 'LibraryRehash',
 
   HlsSessionCleanup = 'HlsSessionCleanup',
 

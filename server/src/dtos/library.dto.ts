@@ -1,6 +1,7 @@
 import { createZodDto } from 'nestjs-zod';
 import z from 'zod';
 import { Library } from 'src/database.js';
+import { ChecksumRehashTargetSchema } from 'src/enum.js';
 import { isoDatetimeToDate } from 'src/validation.js';
 
 const stringArrayMax128 = z
@@ -83,6 +84,13 @@ const LibraryStatsResponseSchema = z
   })
   .meta({ id: 'LibraryStatsResponseDto' });
 
+const RecomputeChecksumsSchema = z
+  .object({
+    target: ChecksumRehashTargetSchema,
+    libraryId: z.uuidv4().optional().describe('Only recompute checksums for this external library'),
+  })
+  .meta({ id: 'RecomputeChecksumsDto' });
+
 export class CreateLibraryDto extends createZodDto(CreateLibrarySchema) {}
 export class UpdateLibraryDto extends createZodDto(UpdateLibrarySchema) {}
 export class ValidateLibraryDto extends createZodDto(ValidateLibrarySchema) {}
@@ -90,6 +98,7 @@ export class ValidateLibraryResponseDto extends createZodDto(ValidateLibraryResp
 export class ValidateLibraryImportPathResponseDto extends createZodDto(ValidateLibraryImportPathResponseSchema) {}
 export class LibraryResponseDto extends createZodDto(LibraryResponseSchema) {}
 export class LibraryStatsResponseDto extends createZodDto(LibraryStatsResponseSchema) {}
+export class RecomputeChecksumsDto extends createZodDto(RecomputeChecksumsSchema) {}
 
 export function mapLibrary(entity: Library): LibraryResponseDto {
   const assetCount = entity.assets ? entity.assets.length : 0;
